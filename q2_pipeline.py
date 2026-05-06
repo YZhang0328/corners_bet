@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,12 +18,22 @@ matplotlib.use("Agg")
 
 STAKE = 1.0
 DEFAULT_EV_THRESHOLD = 0.03
+DEFAULT_MARKET_THRESHOLDS = {"1X2": 0.040, "HC": 0.023, "OU": 0.030}
 DEFAULT_MONTE_CARLO_RUNS = 10_000
 CALIBRATION_MIN_SAMPLES = 120
 CALIBRATION_SHRINKAGE = 500.0
 TAIL_SHRINK_MARKETS = ("1X2", "HC")
 TAIL_SHRINK_MAX_LAMBDA = 6.0
 TAIL_SCALE_GRID = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00]
+NORMAL_Q10_Q90_SPAN = 2.5631031310892007
+DEFAULT_INITIAL_BANKROLL = 100.0
+MAX_FULL_KELLY_FRACTION = 0.10
+DEFAULT_STAKING_PLAN = {
+    "baseline_fixed": {"mode": "fixed", "fraction": 1.0},
+    "kelly_100": {"mode": "kelly", "fraction": 1.0},
+    "kelly_50": {"mode": "kelly", "fraction": 0.5},
+    "kelly_25": {"mode": "kelly", "fraction": 0.25},
+}
 
 
 @dataclass
@@ -35,6 +46,8 @@ class Q2Artifacts:
     base_calibration_report: pd.DataFrame
     partition_summary: pd.DataFrame
     tail_scale_report: pd.DataFrame
+    run_summary: pd.DataFrame
+    staking_summary: pd.DataFrame
 
 
 def print_heading(title: str) -> None:
@@ -45,7 +58,12 @@ def print_heading(title: str) -> None:
 def read_prediction_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load Q1 betting predictions, market prices, and observed results."""
     latest_prediction_path = data_dir / "q1_betting_match_predictions.latest.csv"
-    prediction_path = latest_prediction_path if latest_prediction_path.exists() else data_dir / "q1_betting_match_predictions.csv"
+    candidate_paths = [
+        latest_prediction_path,
+        data_dir / "q1_betting_match_predictions.csv",
+        data_dir / "outputs" / "q1" / "q1_betting_match_predictions.csv",
+    ]
+    prediction_path = next((path for path in candidate_paths if path.exists()), data_dir / "q1_betting_match_predictions.csv")
     predicted_matches = pd.read_csv(prediction_path, parse_dates=["date_time"])
     market_prices = pd.read_csv(data_dir / "corners_prices.csv", parse_dates=["date_time"])
     observed_results = pd.read_csv(data_dir / "corners_prices_results.csv")
@@ -57,14 +75,82 @@ def read_prediction_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, 
     return predicted_matches, market_prices, observed_results
 
 
+def attach_quantile_aware_distribution_inputs(predicted_matches: pd.DataFrame) -> pd.DataFrame:
+    """Attach quantile diagnostics while keeping raw Q1 mean/variance as the primary moments."""
+    prepared = predicted_matches.copy()
+    prepared["q2_home_center"] = prepared["pred_home_corners"]
+    prepared["q2_away_center"] = prepared["pred_away_corners"]
+    prepared["q2_home_variance"] = prepared["sigma2_home"]
+    prepared["q2_away_variance"] = prepared["sigma2_away"]
+    prepared["quantile_home_center"] = prepared.get("pred_home_q50", prepared["pred_home_corners"])
+    prepared["quantile_away_center"] = prepared.get("pred_away_q50", prepared["pred_away_corners"])
+    prepared["quantile_home_variance"] = prepared.get("quantile_sigma2_home", prepared["sigma2_home"])
+    prepared["quantile_away_variance"] = prepared.get("quantile_sigma2_away", prepared["sigma2_away"])
+
+    print_heading("Quantile-Aware Moments")
+    print(
+        f"q50 coverage home={prepared['quantile_home_center'].notna().mean():.1%} "
+        f"away={prepared['quantile_away_center'].notna().mean():.1%} | "
+        f"median quantile/raw variance ratio home={np.median(prepared['quantile_home_variance'] / prepared['sigma2_home']):.3f} "
+        f"away={np.median(prepared['quantile_away_variance'] / prepared['sigma2_away']):.3f}"
+    )
+    return prepared
+
+
+def quantile_tail_distance(prediction_row: pd.Series, market_type: str, market_line: float, side_name: str) -> float:
+    """Measure how far a candidate side sits outside Q1's empirical q10-q90 envelope."""
+    required_cols = {
+        "pred_home_q10",
+        "pred_home_q50",
+        "pred_home_q90",
+        "pred_away_q10",
+        "pred_away_q50",
+        "pred_away_q90",
+    }
+    if not required_cols.issubset(prediction_row.index):
+        return 0.0
+    if prediction_row[list(required_cols)].isna().any():
+        return 0.0
+
+    total_q10 = float(prediction_row["pred_home_q10"] + prediction_row["pred_away_q10"])
+    total_q90 = float(prediction_row["pred_home_q90"] + prediction_row["pred_away_q90"])
+    total_width = max(total_q90 - total_q10, 1e-6)
+
+    diff_q10 = float(prediction_row["pred_home_q10"] - prediction_row["pred_away_q90"])
+    diff_q50 = float(prediction_row["pred_home_q50"] - prediction_row["pred_away_q50"])
+    diff_q90 = float(prediction_row["pred_home_q90"] - prediction_row["pred_away_q10"])
+    diff_width = max(diff_q90 - diff_q10, 1e-6)
+
+    if market_type == "OU":
+        if side_name == "over":
+            return max(market_line - total_q90, 0.0) / total_width
+        if side_name == "under":
+            return max(total_q10 - market_line, 0.0) / total_width
+        return 0.0
+
+    if market_type == "HC":
+        if side_name == "home":
+            return max(market_line - diff_q90, 0.0) / diff_width
+        if side_name == "away":
+            return max(diff_q10 - market_line, 0.0) / diff_width
+        return 0.0
+
+    if side_name == "home":
+        return max(0.0 - diff_q90, 0.0) / diff_width
+    if side_name == "away":
+        return max(diff_q10 - 0.0, 0.0) / diff_width
+    half_width = max(diff_width / 2.0, 1e-6)
+    return max(abs(diff_q50) - half_width, 0.0) / half_width
+
+
 def estimate_shared_correlation(calibration_matches: pd.DataFrame) -> dict[str, float]:
     """Estimate one shared home-away corner correlation from partition A."""
     clean_rows = calibration_matches.dropna(
         subset=[
-            "pred_home_corners",
-            "pred_away_corners",
-            "sigma2_home",
-            "sigma2_away",
+            "q2_home_center",
+            "q2_away_center",
+            "q2_home_variance",
+            "q2_away_variance",
             "home_corners",
             "away_corners",
         ]
@@ -72,12 +158,12 @@ def estimate_shared_correlation(calibration_matches: pd.DataFrame) -> dict[str, 
     if clean_rows.empty:
         return {"rho": -0.20, "k_total": np.nan, "k_diff": np.nan, "n": 0}
 
-    independent_variance = clean_rows["sigma2_home"] + clean_rows["sigma2_away"]
-    covariance_term = np.sqrt(np.maximum(clean_rows["sigma2_home"], 1e-6) * np.maximum(clean_rows["sigma2_away"], 1e-6))
+    independent_variance = clean_rows["q2_home_variance"] + clean_rows["q2_away_variance"]
+    covariance_term = np.sqrt(np.maximum(clean_rows["q2_home_variance"], 1e-6) * np.maximum(clean_rows["q2_away_variance"], 1e-6))
     actual_total = clean_rows["home_corners"] + clean_rows["away_corners"]
-    predicted_total = clean_rows["pred_home_corners"] + clean_rows["pred_away_corners"]
+    predicted_total = clean_rows["q2_home_center"] + clean_rows["q2_away_center"]
     actual_diff = clean_rows["home_corners"] - clean_rows["away_corners"]
-    predicted_diff = clean_rows["pred_home_corners"] - clean_rows["pred_away_corners"]
+    predicted_diff = clean_rows["q2_home_center"] - clean_rows["q2_away_center"]
 
     total_residual_variance = float(np.mean((actual_total - predicted_total) ** 2))
     diff_residual_variance = float(np.mean((actual_diff - predicted_diff) ** 2))
@@ -213,10 +299,10 @@ def quoted_market_line(price_row: pd.Series) -> float:
 
 def market_outcome_probabilities(prediction_row: pd.Series, price_row: pd.Series, shared_rho: float) -> dict[str, float]:
     """Turn one Q1 prediction row into market outcome probabilities."""
-    predicted_home_corners = float(prediction_row["pred_home_corners"])
-    predicted_away_corners = float(prediction_row["pred_away_corners"])
-    predicted_home_variance = float(prediction_row["sigma2_home"])
-    predicted_away_variance = float(prediction_row["sigma2_away"])
+    predicted_home_corners = float(prediction_row["q2_home_center"])
+    predicted_away_corners = float(prediction_row["q2_away_center"])
+    predicted_home_variance = float(prediction_row["q2_home_variance"])
+    predicted_away_variance = float(prediction_row["q2_away_variance"])
     market_type = price_row["odds_type"]
     market_line = quoted_market_line(price_row)
 
@@ -335,6 +421,7 @@ def build_candidate_side_rows(
                     "group_id": market_group_id,
                     "side": side_name,
                     "p_raw": float(np.clip(model_probability, 1e-6, 1 - 1e-6)),
+                    "quantile_tail_distance": float(quantile_tail_distance(pd.Series(prediction_row), market_type, market_line, side_name)),
                     "odds": decimal_odds,
                     "bettable": bool(not np.isnan(decimal_odds)),
                 }
@@ -472,6 +559,45 @@ def attach_no_vig_market_probabilities(candidate_bets: pd.DataFrame) -> pd.DataF
     return with_market_probs
 
 
+def resolve_market_thresholds(
+    ev_threshold: float | None = None,
+    market_thresholds: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Resolve the effective per-market EV thresholds for bet selection."""
+    if market_thresholds is not None:
+        return {market_name: float(value) for market_name, value in market_thresholds.items()}
+    if ev_threshold is None:
+        return dict(DEFAULT_MARKET_THRESHOLDS)
+    return {market_name: float(ev_threshold) for market_name in ["1X2", "HC", "OU"]}
+
+
+def threshold_column_name(probability_column: str) -> str:
+    """Convert an EV column name into the corresponding threshold column name."""
+    return "threshold_" + probability_column.replace("ev_", "")
+
+
+def attach_market_thresholds(candidate_bets: pd.DataFrame, market_thresholds: dict[str, float]) -> pd.DataFrame:
+    """Attach market-specific threshold columns to one bet table."""
+    with_thresholds = candidate_bets.copy()
+    with_thresholds["threshold_ev"] = with_thresholds["odds_type"].map(market_thresholds).fillna(DEFAULT_EV_THRESHOLD)
+    for probability_column in ["ev_raw", "ev", "ev_tail"]:
+        if probability_column in with_thresholds.columns:
+            with_thresholds[threshold_column_name(probability_column)] = with_thresholds["threshold_ev"]
+    return with_thresholds
+
+
+def select_bets_with_market_thresholds(
+    candidate_bets: pd.DataFrame,
+    ev_column: str,
+) -> pd.DataFrame:
+    """Select bettable sides whose EV clears the threshold assigned to their market."""
+    threshold_col = threshold_column_name(ev_column)
+    selected = candidate_bets[
+        candidate_bets["bettable"] & candidate_bets[ev_column].notna() & (candidate_bets[ev_column] > candidate_bets[threshold_col])
+    ].copy()
+    return selected
+
+
 def apply_tail_probability_shrink(
     candidate_bets: pd.DataFrame,
     lambda_by_market: dict[str, float],
@@ -490,7 +616,8 @@ def apply_tail_probability_shrink(
     subset = shrunk.loc[mask].copy()
     lambda_values = subset["odds_type"].map(lambda_by_market).fillna(0.0).to_numpy(dtype=float)
     positive_edge = np.maximum(subset["ev"].to_numpy(dtype=float) - DEFAULT_EV_THRESHOLD, 0.0)
-    tail_weight = 1.0 - np.exp(-(lambda_values * tail_scale) * positive_edge)
+    quantile_multiplier = 1.0 + subset["quantile_tail_distance"].fillna(0.0).to_numpy(dtype=float)
+    tail_weight = 1.0 - np.exp(-(lambda_values * tail_scale) * positive_edge * quantile_multiplier)
     tail_probability = np.clip(
         (1.0 - tail_weight) * subset["p_model"].to_numpy(dtype=float) + tail_weight * subset["p_market"].to_numpy(dtype=float),
         1e-6,
@@ -503,16 +630,16 @@ def apply_tail_probability_shrink(
     return shrunk
 
 
-def fit_tail_lambda(training_bets: pd.DataFrame, odds_type: str, ev_threshold: float) -> float:
+def fit_tail_lambda(training_bets: pd.DataFrame, odds_type: str, market_threshold: float) -> float:
     """Choose how aggressively one market's high-EV tail should revert to market probabilities."""
-    subset = training_bets[(training_bets["bettable"]) & (training_bets["odds_type"] == odds_type) & (training_bets["ev"] > ev_threshold)].copy()
+    subset = training_bets[(training_bets["bettable"]) & (training_bets["odds_type"] == odds_type) & (training_bets["ev"] > market_threshold)].copy()
     if subset.empty:
         return 0.0
 
     actual_wins = subset["won"].to_numpy(dtype=float)
     model_probability = subset["p_model"].to_numpy(dtype=float)
     market_probability = subset["p_market"].to_numpy(dtype=float)
-    positive_edge = np.maximum(subset["ev"].to_numpy(dtype=float) - ev_threshold, 0.0)
+    positive_edge = np.maximum(subset["ev"].to_numpy(dtype=float) - market_threshold, 0.0)
 
     def objective(lambda_value: float) -> float:
         tail_weight = 1.0 - np.exp(-lambda_value * positive_edge)
@@ -535,7 +662,11 @@ def realised_roi(selected_bets: pd.DataFrame) -> float:
     return float(np.mean(profit))
 
 
-def choose_tail_scale(training_bets: pd.DataFrame, lambda_by_market: dict[str, float], ev_threshold: float) -> tuple[float, pd.DataFrame]:
+def choose_tail_scale(
+    training_bets: pd.DataFrame,
+    lambda_by_market: dict[str, float],
+    market_thresholds: dict[str, float],
+) -> tuple[float, pd.DataFrame]:
     """Choose the tail-shrink scale that best aligns A-side mean EV with realised ROI."""
     diagnostics: list[dict[str, float | int]] = []
     best_scale = 0.0
@@ -543,7 +674,8 @@ def choose_tail_scale(training_bets: pd.DataFrame, lambda_by_market: dict[str, f
 
     for candidate_scale in TAIL_SCALE_GRID:
         shrunk = apply_tail_probability_shrink(training_bets, lambda_by_market, candidate_scale)
-        selected = shrunk[(shrunk["bettable"]) & (shrunk["ev_tail"] > ev_threshold)].copy()
+        shrunk = attach_market_thresholds(shrunk, market_thresholds)
+        selected = select_bets_with_market_thresholds(shrunk, "ev_tail")
         mean_ev = float(selected["ev_tail"].mean()) if not selected.empty else np.nan
         actual_roi = realised_roi(selected)
         gap = abs(mean_ev - actual_roi) if np.isfinite(mean_ev) and np.isfinite(actual_roi) else np.inf
@@ -577,6 +709,197 @@ def summarize_market_calibration(raw_bets: pd.DataFrame, calibrated_bets: pd.Dat
             }
         )
     return pd.DataFrame(rows)
+
+
+def full_kelly_fraction(win_probability: np.ndarray, decimal_odds: np.ndarray) -> np.ndarray:
+    """Compute a practical full-Kelly bankroll fraction for decimal odds, capped per bet."""
+    net_odds = np.maximum(decimal_odds - 1.0, 1e-6)
+    raw_fraction = (win_probability * decimal_odds - 1.0) / net_odds
+    return np.clip(raw_fraction, 0.0, MAX_FULL_KELLY_FRACTION)
+
+
+def run_staking_path(
+    selected_bets: pd.DataFrame,
+    stake_mode: str,
+    fraction_scale: float,
+    initial_bankroll: float,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Replay one realised bet sequence under fixed-stake or fractional Kelly sizing."""
+    path = selected_bets.sort_values("date_time").reset_index(drop=True).copy()
+    bankroll = float(initial_bankroll)
+    bankroll_before: list[float] = []
+    stake_sizes: list[float] = []
+    pnl_values: list[float] = []
+    bankroll_after: list[float] = []
+
+    full_fraction = full_kelly_fraction(path["p_tail"].to_numpy(dtype=float), path["odds"].to_numpy(dtype=float))
+    path["full_kelly_fraction"] = full_fraction
+    if stake_mode == "fixed":
+        target_fraction = np.zeros(len(path), dtype=float)
+    else:
+        target_fraction = np.clip(full_fraction * fraction_scale, 0.0, 1.0)
+    path["stake_fraction"] = target_fraction
+
+    for _, group in path.groupby("date_time", sort=True):
+        bankroll_group_start = bankroll
+        group_indices = group.index.to_list()
+        if stake_mode == "fixed":
+            group_stakes = np.repeat(STAKE * fraction_scale, len(group_indices)).astype(float)
+            total_group_stake = group_stakes.sum()
+            if total_group_stake > bankroll_group_start and total_group_stake > 0:
+                group_stakes *= bankroll_group_start / total_group_stake
+        else:
+            group_stakes = bankroll_group_start * target_fraction[group_indices]
+            total_group_stake = group_stakes.sum()
+            if total_group_stake > bankroll_group_start and total_group_stake > 0:
+                group_stakes *= bankroll_group_start / total_group_stake
+
+        group_profits = np.where(
+            group["won"].to_numpy(dtype=float) == 1.0,
+            group_stakes * (group["odds"].to_numpy(dtype=float) - 1.0),
+            -group_stakes,
+        )
+        bankroll += float(group_profits.sum())
+
+        for local_pos, group_index in enumerate(group_indices):
+            bankroll_before.append(bankroll_group_start)
+            stake_sizes.append(float(group_stakes[local_pos]))
+            pnl_values.append(float(group_profits[local_pos]))
+            bankroll_after.append(bankroll_group_start + float(np.sum(group_profits[: local_pos + 1])))
+
+    path["bankroll_before"] = bankroll_before
+    path["stake_size"] = stake_sizes
+    path["strategy_pnl"] = pnl_values
+    path["bankroll_after"] = bankroll_after
+    peak_bankroll = path["bankroll_after"].cummax() if len(path) else pd.Series(dtype=float)
+    drawdown = (path["bankroll_after"] - peak_bankroll) / peak_bankroll if len(path) else pd.Series(dtype=float)
+
+    total_staked = float(path["stake_size"].sum())
+    total_pnl = float(path["strategy_pnl"].sum())
+    ending_bankroll = float(bankroll)
+    summary = {
+        "bets": int(len(path)),
+        "total_staked": total_staked,
+        "total_pnl": total_pnl,
+        "turnover_roi": total_pnl / total_staked if total_staked else np.nan,
+        "ending_bankroll": ending_bankroll,
+        "bankroll_return": ending_bankroll / initial_bankroll - 1.0 if initial_bankroll else np.nan,
+        "max_drawdown": float(drawdown.min()) if len(path) else np.nan,
+        "average_stake": float(path["stake_size"].mean()) if len(path) else np.nan,
+        "median_stake": float(path["stake_size"].median()) if len(path) else np.nan,
+        "average_fraction": float(path["stake_fraction"].mean()) if len(path) else np.nan,
+    }
+    return path, summary
+
+
+def simulate_staking_distribution(
+    selected_bets: pd.DataFrame,
+    stake_mode: str,
+    fraction_scale: float,
+    initial_bankroll: float,
+    monte_carlo_runs: int,
+) -> dict[str, float]:
+    """Simulate final PnL and ending bankroll distribution under one staking plan."""
+    if selected_bets.empty:
+        return {
+            "mc_p5_pnl": np.nan,
+            "mc_p50_pnl": np.nan,
+            "mc_p95_pnl": np.nan,
+            "mc_p5_bankroll": np.nan,
+            "mc_p50_bankroll": np.nan,
+            "mc_p95_bankroll": np.nan,
+            "mc_positive_prob": np.nan,
+            "mc_actual_percentile": np.nan,
+            "simulated_total_pnl": np.array([], dtype=float),
+        }
+
+    rng = np.random.default_rng(42)
+    win_probability = selected_bets["p_tail"].to_numpy(dtype=float)
+    decimal_odds = selected_bets["odds"].to_numpy(dtype=float)
+    realised_wins = selected_bets["won"].to_numpy(dtype=float)
+    simulated_wins = rng.random((monte_carlo_runs, len(selected_bets))) < win_probability[None, :]
+    bankrolls = np.full(monte_carlo_runs, float(initial_bankroll), dtype=float)
+
+    full_fraction = full_kelly_fraction(win_probability, decimal_odds)
+    if stake_mode == "fixed":
+        per_bet_fraction = np.zeros(len(selected_bets), dtype=float)
+    else:
+        per_bet_fraction = np.clip(full_fraction * fraction_scale, 0.0, 1.0)
+
+    actual_path, actual_summary = run_staking_path(selected_bets, stake_mode, fraction_scale, initial_bankroll)
+    del actual_path
+
+    ordered_bets = selected_bets.sort_values("date_time").reset_index(drop=True)
+    date_groups = ordered_bets.groupby("date_time", sort=True).indices
+    for group_indices in date_groups.values():
+        group_indices = np.asarray(group_indices, dtype=int)
+        group_bankroll_start = bankrolls.copy()
+        if stake_mode == "fixed":
+            group_stakes = np.full((monte_carlo_runs, len(group_indices)), STAKE * fraction_scale, dtype=float)
+            stake_totals = group_stakes.sum(axis=1)
+            scale = np.where(stake_totals > group_bankroll_start, group_bankroll_start / np.maximum(stake_totals, 1e-12), 1.0)
+            group_stakes = group_stakes * scale[:, None]
+        else:
+            group_stakes = group_bankroll_start[:, None] * per_bet_fraction[group_indices][None, :]
+            stake_totals = group_stakes.sum(axis=1)
+            scale = np.where(stake_totals > group_bankroll_start, group_bankroll_start / np.maximum(stake_totals, 1e-12), 1.0)
+            group_stakes = group_stakes * scale[:, None]
+
+        group_odds = decimal_odds[group_indices][None, :]
+        group_wins = simulated_wins[:, group_indices]
+        group_profits = np.where(group_wins, group_stakes * (group_odds - 1.0), -group_stakes)
+        bankrolls = bankrolls + group_profits.sum(axis=1)
+
+    simulated_total_pnl = bankrolls - initial_bankroll
+    return {
+        "mc_p5_pnl": float(np.percentile(simulated_total_pnl, 5)),
+        "mc_p50_pnl": float(np.percentile(simulated_total_pnl, 50)),
+        "mc_p95_pnl": float(np.percentile(simulated_total_pnl, 95)),
+        "mc_p5_bankroll": float(np.percentile(bankrolls, 5)),
+        "mc_p50_bankroll": float(np.percentile(bankrolls, 50)),
+        "mc_p95_bankroll": float(np.percentile(bankrolls, 95)),
+        "mc_positive_prob": float((simulated_total_pnl > 0).mean()),
+        "mc_actual_percentile": float((simulated_total_pnl <= actual_summary["total_pnl"]).mean() * 100),
+        "simulated_total_pnl": simulated_total_pnl,
+    }
+
+
+def compare_staking_plans(
+    selected_bets: pd.DataFrame,
+    monte_carlo_runs: int,
+    initial_bankroll: float = DEFAULT_INITIAL_BANKROLL,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Compare baseline fixed stakes with multiple Kelly fractions on the same selected bets."""
+    bet_paths: dict[str, pd.DataFrame] = {}
+    summary_rows: list[dict[str, float | str]] = []
+
+    for strategy_name, config in DEFAULT_STAKING_PLAN.items():
+        path, realised_summary = run_staking_path(
+            selected_bets,
+            stake_mode=str(config["mode"]),
+            fraction_scale=float(config["fraction"]),
+            initial_bankroll=initial_bankroll,
+        )
+        mc_summary = simulate_staking_distribution(
+            selected_bets,
+            stake_mode=str(config["mode"]),
+            fraction_scale=float(config["fraction"]),
+            initial_bankroll=initial_bankroll,
+            monte_carlo_runs=monte_carlo_runs,
+        )
+        bet_paths[strategy_name] = path
+        summary_rows.append(
+            {
+                "strategy": strategy_name,
+                "stake_mode": str(config["mode"]),
+                "fraction_scale": float(config["fraction"]),
+                **realised_summary,
+                **{key: value for key, value in mc_summary.items() if key != "simulated_total_pnl"},
+            }
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    return bet_paths, summary
 
 
 def evaluate_selected_bets(selected_bets: pd.DataFrame, monte_carlo_runs: int) -> dict[str, float]:
@@ -697,15 +1020,56 @@ def plot_monte_carlo_distribution(evaluation: dict[str, float], output_dir: Path
     plt.close(fig)
 
 
+def save_q2_outputs(
+    output_dir: Path,
+    partition_a_bets: pd.DataFrame,
+    partition_b_bets: pd.DataFrame,
+    selected_bets: pd.DataFrame,
+    staking_paths: dict[str, pd.DataFrame],
+    base_calibration_report: pd.DataFrame,
+    partition_summary: pd.DataFrame,
+    tail_scale_report: pd.DataFrame,
+    run_summary: pd.DataFrame,
+    staking_summary: pd.DataFrame,
+) -> None:
+    """Persist Q2 tables for one run into the chosen output directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def safe_write_csv(frame: pd.DataFrame, path: Path) -> None:
+        try:
+            frame.to_csv(path, index=False)
+        except PermissionError:
+            fallback = path.with_name(f"{path.stem}.latest{path.suffix}")
+            frame.to_csv(fallback, index=False)
+
+    safe_write_csv(partition_a_bets, output_dir / "partition_a_bets.csv")
+    safe_write_csv(partition_b_bets, output_dir / "partition_b_bets.csv")
+    safe_write_csv(selected_bets, output_dir / "selected_bets.csv")
+    for strategy_name, path in staking_paths.items():
+        safe_write_csv(path, output_dir / f"{strategy_name}_bet_path.csv")
+    safe_write_csv(base_calibration_report, output_dir / "base_calibration_report.csv")
+    safe_write_csv(partition_summary, output_dir / "partition_summary.csv")
+    safe_write_csv(tail_scale_report, output_dir / "tail_scale_report.csv")
+    safe_write_csv(run_summary, output_dir / "run_summary.csv")
+    safe_write_csv(staking_summary, output_dir / "staking_summary.csv")
+
+
 def run_q2_pipeline(
     data_dir: str | Path = ".",
-    ev_threshold: float = DEFAULT_EV_THRESHOLD,
+    ev_threshold: float | None = None,
+    market_thresholds: dict[str, float] | None = None,
     monte_carlo_runs: int = DEFAULT_MONTE_CARLO_RUNS,
+    output_dir: str | Path | None = None,
+    evaluation_scope: str = "B",
     make_plots: bool = True,
 ) -> Q2Artifacts:
     """Run the full Q2 market-probability, calibration, and backtest pipeline."""
-    output_dir = Path(data_dir)
-    predicted_matches, market_prices, observed_results = read_prediction_inputs(output_dir)
+    data_path = Path(data_dir)
+    result_path = Path(output_dir) if output_dir is not None else data_path
+    result_path.mkdir(parents=True, exist_ok=True)
+    effective_thresholds = resolve_market_thresholds(ev_threshold, market_thresholds)
+    predicted_matches, market_prices, observed_results = read_prediction_inputs(data_path)
+    predicted_matches = attach_quantile_aware_distribution_inputs(predicted_matches)
     partition_a_predictions = predicted_matches[predicted_matches["partition"] == "A"].copy()
     partition_b_predictions = predicted_matches[predicted_matches["partition"] == "B"].copy()
 
@@ -748,11 +1112,14 @@ def run_q2_pipeline(
     )
 
     tail_lambda_map = {
-        market_name: fit_tail_lambda(partition_a_calibrated, market_name, ev_threshold) for market_name in TAIL_SHRINK_MARKETS
+        market_name: fit_tail_lambda(partition_a_calibrated, market_name, effective_thresholds[market_name])
+        for market_name in TAIL_SHRINK_MARKETS
     }
-    tail_scale, tail_scale_report = choose_tail_scale(partition_a_calibrated, tail_lambda_map, ev_threshold)
+    tail_scale, tail_scale_report = choose_tail_scale(partition_a_calibrated, tail_lambda_map, effective_thresholds)
     partition_a_final = apply_tail_probability_shrink(partition_a_calibrated, tail_lambda_map, tail_scale)
     partition_b_final = apply_tail_probability_shrink(partition_b_calibrated, tail_lambda_map, tail_scale)
+    partition_a_final = attach_market_thresholds(partition_a_final, effective_thresholds)
+    partition_b_final = attach_market_thresholds(partition_b_final, effective_thresholds)
 
     print_heading("Base Calibration")
     print(base_calibration_report.round(4).to_string(index=False))
@@ -761,25 +1128,55 @@ def run_q2_pipeline(
     print_heading("Tail Shrink")
     print(f"lambda map={tail_lambda_map}")
     print(f"selected tail scale={tail_scale:.2f}")
+    print(f"market thresholds={effective_thresholds}")
     print(tail_scale_report.round(4).to_string(index=False))
 
-    selected_a_bets = partition_a_final[(partition_a_final["bettable"]) & (partition_a_final["ev_tail"] > ev_threshold)].copy()
+    selected_a_bets = select_bets_with_market_thresholds(partition_a_final, "ev_tail")
     print(
         f"A selected tail check: bets={len(selected_a_bets)} "
         f"mean_ev={selected_a_bets['ev_tail'].mean():+.4f} "
         f"realised_roi={realised_roi(selected_a_bets):+.4f}"
     )
 
-    selected_bets = partition_b_final[(partition_b_final["bettable"]) & (partition_b_final["ev_tail"] > ev_threshold)].copy()
+    if evaluation_scope.upper() == "ALL":
+        evaluation_pool = pd.concat([partition_a_final, partition_b_final], ignore_index=True)
+    else:
+        evaluation_pool = partition_b_final.copy()
+
+    selected_bets = select_bets_with_market_thresholds(evaluation_pool, "ev_tail")
     selected_bets = selected_bets.sort_values("date_time").reset_index(drop=True)
     selected_bets["pnl"] = np.where(selected_bets["won"] == 1, STAKE * (selected_bets["odds"] - 1), -STAKE)
     selected_bets["cum_pnl"] = selected_bets["pnl"].cumsum()
     selected_bets["cum_ev"] = (selected_bets["ev_tail"] * STAKE).cumsum()
 
     evaluation = evaluate_selected_bets(selected_bets, monte_carlo_runs)
+    staking_paths, staking_summary = compare_staking_plans(selected_bets, monte_carlo_runs)
+    run_summary = pd.DataFrame(
+        [
+            {
+                "evaluation_scope": evaluation_scope.upper(),
+                "threshold_1x2": effective_thresholds["1X2"],
+                "threshold_hc": effective_thresholds["HC"],
+                "threshold_ou": effective_thresholds["OU"],
+                "bets": evaluation["bets"],
+                "total_pnl": evaluation["total_pnl"],
+                "roi": evaluation["roi"],
+                "win_rate": evaluation["win_rate"],
+                "mean_tail_ev": evaluation["mean_tail_ev"],
+                "mean_base_ev": evaluation["mean_base_ev"],
+                "mean_raw_ev": evaluation["mean_raw_ev"],
+                "mc_p5": evaluation["mc_p5"],
+                "mc_p50": evaluation["mc_p50"],
+                "mc_p95": evaluation["mc_p95"],
+                "mc_positive_prob": evaluation["mc_positive_prob"],
+                "mc_actual_percentile": evaluation["mc_actual_percentile"],
+            }
+        ]
+    )
     print_heading("Q2 Selection Summary")
     print(f"Bets placed        : {evaluation['bets']}")
-    print(f"EV threshold       : >{ev_threshold:.2f}")
+    print(f"Evaluation scope   : {evaluation_scope.upper()}")
+    print(f"EV thresholds      : 1X2>{effective_thresholds['1X2']:.3f} HC>{effective_thresholds['HC']:.3f} OU>{effective_thresholds['OU']:.3f}")
     print(f"Breakdown by market: {selected_bets['odds_type'].value_counts().to_dict()}")
     print_heading("Q2 Overall PnL / RoI")
     print(f"Total staked       : {evaluation['bets'] * STAKE:.2f} units")
@@ -795,11 +1192,42 @@ def run_q2_pipeline(
     print(f"MC 5th-95th pct    : [{evaluation['mc_p5']:+.2f}, {evaluation['mc_p95']:+.2f}]")
     print(f"P(positive PnL)    : {evaluation['mc_positive_prob']:.2%}")
     print(f"Actual percentile  : {evaluation['mc_actual_percentile']:.0f}th")
+    print_heading("Staking Comparison")
+    print(f"Kelly cap per bet : {MAX_FULL_KELLY_FRACTION:.1%} of bankroll")
+    print(
+        staking_summary[
+            [
+                "strategy",
+                "total_pnl",
+                "turnover_roi",
+                "ending_bankroll",
+                "bankroll_return",
+                "max_drawdown",
+                "mc_p50_pnl",
+                "mc_actual_percentile",
+            ]
+        ]
+        .round(4)
+        .to_string(index=False)
+    )
 
     if make_plots:
-        plot_cumulative_pnl(selected_bets, output_dir)
-        plot_rolling_pnl(selected_bets, output_dir)
-        plot_monte_carlo_distribution(evaluation, output_dir)
+        plot_cumulative_pnl(selected_bets, result_path)
+        plot_rolling_pnl(selected_bets, result_path)
+        plot_monte_carlo_distribution(evaluation, result_path)
+
+    save_q2_outputs(
+        result_path,
+        partition_a_final,
+        partition_b_final,
+        selected_bets,
+        staking_paths,
+        base_calibration_report,
+        partition_summary,
+        tail_scale_report,
+        run_summary,
+        staking_summary,
+    )
 
     return Q2Artifacts(
         partition_a_bets=partition_a_final,
@@ -808,4 +1236,56 @@ def run_q2_pipeline(
         base_calibration_report=base_calibration_report,
         partition_summary=partition_summary,
         tail_scale_report=tail_scale_report,
+        run_summary=run_summary,
+        staking_summary=staking_summary,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the standalone Q2 runner."""
+    parser = argparse.ArgumentParser(description="Run the Q2 calibration and betting backtest pipeline.")
+    parser.add_argument("--data-dir", default=".", help="Directory containing Q1 outputs and market price files.")
+    parser.add_argument(
+        "--ev-threshold",
+        type=float,
+        default=None,
+        help="Optional single EV threshold applied to every market. Omit to use the per-market defaults.",
+    )
+    parser.add_argument("--threshold-1x2", type=float, default=DEFAULT_MARKET_THRESHOLDS["1X2"], help="EV threshold for 1X2 bets.")
+    parser.add_argument("--threshold-hc", type=float, default=DEFAULT_MARKET_THRESHOLDS["HC"], help="EV threshold for handicap bets.")
+    parser.add_argument("--threshold-ou", type=float, default=DEFAULT_MARKET_THRESHOLDS["OU"], help="EV threshold for over/under bets.")
+    parser.add_argument(
+        "--monte-carlo-runs",
+        type=int,
+        default=DEFAULT_MONTE_CARLO_RUNS,
+        help="Number of Monte Carlo paths for the PnL simulation.",
+    )
+    parser.add_argument("--output-dir", default=".", help="Directory where Q2 result files and plots should be written.")
+    parser.add_argument(
+        "--evaluation-scope",
+        default="B",
+        choices=["B", "ALL"],
+        help="Evaluate on clean partition B only, or on the full betting window (A+B).",
+    )
+    parser.add_argument("--no-plots", action="store_true", help="Skip PNG generation.")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    cli_args = parse_args()
+    cli_market_thresholds = None
+    if cli_args.ev_threshold is None:
+        cli_market_thresholds = {
+            "1X2": cli_args.threshold_1x2,
+            "HC": cli_args.threshold_hc,
+            "OU": cli_args.threshold_ou,
+        }
+    run_q2_pipeline(
+        data_dir=cli_args.data_dir,
+        ev_threshold=cli_args.ev_threshold,
+        market_thresholds=cli_market_thresholds,
+        monte_carlo_runs=cli_args.monte_carlo_runs,
+        output_dir=cli_args.output_dir,
+        evaluation_scope=cli_args.evaluation_scope,
+        make_plots=not cli_args.no_plots,
     )

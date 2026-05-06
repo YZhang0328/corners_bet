@@ -88,6 +88,10 @@ CATEGORICAL_COLS = ["competition_id", "season_id"]
 MARKET_TWO_WAY_FILL = 1 / 3
 MARKET_TARGET_MIN_TOTAL = 0.1
 MARKET_TARGET_MAX_TOTAL = 30.0
+RESIDUAL_QUANTILES = (0.10, 0.50, 0.90)
+RESIDUAL_QUANTILE_BUCKETS = 4
+RESIDUAL_QUANTILE_MIN_GROUP = 12
+NORMAL_Q10_Q90_SPAN = 2.5631031310892007
 
 
 @dataclass
@@ -267,6 +271,375 @@ def infer_market_means_for_row(row: pd.Series) -> tuple[float, float] | None:
     if total_mean is None:
         return None
     return solve_home_away_means_from_market(total_mean, prob_home, prob_away, prob_draw)
+
+
+def compute_market_feature_row(row: pd.Series) -> pd.Series:
+    """Turn raw 1X2/OU/HC prices into one row of abstract market features."""
+    probs_1x2 = devig_three_way(row.get("p1x2_home_price"), row.get("p1x2_away_price"), row.get("p1x2_draw_price"))
+    probs_ou = devig_two_way(row.get("ou_over_price"), row.get("ou_under_price"))
+    probs_hc = devig_two_way(row.get("hc_home_price"), row.get("hc_away_price"))
+
+    market_home_mean = row.get("market_target_home", np.nan)
+    market_away_mean = row.get("market_target_away", np.nan)
+    market_total_mean = np.nan
+    market_diff_mean = np.nan
+    if pd.notna(market_home_mean) and pd.notna(market_away_mean):
+        market_total_mean = float(market_home_mean + market_away_mean)
+        market_diff_mean = float(market_home_mean - market_away_mean)
+
+    p_1x2_home = probs_1x2[0] if probs_1x2 is not None else 1 / 3
+    p_1x2_away = probs_1x2[1] if probs_1x2 is not None else 1 / 3
+    p_1x2_draw = probs_1x2[2] if probs_1x2 is not None else 1 / 3
+    p_ou_over = probs_ou[0] if probs_ou is not None else 0.5
+    p_ou_under = probs_ou[1] if probs_ou is not None else 0.5
+    p_hc_home = probs_hc[0] if probs_hc is not None else 0.5
+    p_hc_away = probs_hc[1] if probs_hc is not None else 0.5
+
+    total_certainty = abs(p_ou_over - 0.5)
+    side_certainty = abs(p_1x2_home - p_1x2_away)
+    handicap_certainty = abs(p_hc_home - 0.5)
+    certainty_components = [total_certainty, side_certainty]
+    if probs_hc is not None:
+        certainty_components.append(handicap_certainty)
+    market_quantile_certainty = float(np.mean(certainty_components))
+
+    predicted_home_mean = float(row["predicted_home_mean"])
+    predicted_away_mean = float(row["predicted_away_mean"])
+    predicted_total_mean = float(row["predicted_total_mean"])
+    predicted_diff_mean = float(row["predicted_diff_mean"])
+
+    market_vs_model_home_gap = market_home_mean - predicted_home_mean if pd.notna(market_home_mean) else 0.0
+    market_vs_model_away_gap = market_away_mean - predicted_away_mean if pd.notna(market_away_mean) else 0.0
+    market_vs_model_total_gap = market_total_mean - predicted_total_mean if pd.notna(market_total_mean) else 0.0
+    market_vs_model_diff_gap = market_diff_mean - predicted_diff_mean if pd.notna(market_diff_mean) else 0.0
+
+    return pd.Series(
+        {
+            "market_prob_1x2_home": p_1x2_home,
+            "market_prob_1x2_away": p_1x2_away,
+            "market_prob_1x2_draw": p_1x2_draw,
+            "market_prob_ou_over": p_ou_over,
+            "market_prob_ou_under": p_ou_under,
+            "market_prob_hc_home": p_hc_home,
+            "market_prob_hc_away": p_hc_away,
+            "market_home_mean": market_home_mean,
+            "market_away_mean": market_away_mean,
+            "market_total_mean": market_total_mean,
+            "market_diff_mean": market_diff_mean,
+            "market_total_certainty": total_certainty,
+            "market_side_certainty": side_certainty,
+            "market_handicap_certainty": handicap_certainty,
+            "market_quantile_certainty": market_quantile_certainty,
+            "market_draw_prob": p_1x2_draw,
+            "market_vs_model_home_gap": market_vs_model_home_gap,
+            "market_vs_model_away_gap": market_vs_model_away_gap,
+            "market_vs_model_total_gap": market_vs_model_total_gap,
+            "market_vs_model_diff_gap": market_vs_model_diff_gap,
+            "market_tail_width_proxy": total_certainty + 0.5 * market_quantile_certainty,
+            "market_upper_tail_home_proxy": max(p_1x2_home - p_1x2_away, 0.0) + max(p_hc_home - 0.5, 0.0),
+            "market_upper_tail_away_proxy": max(p_1x2_away - p_1x2_home, 0.0) + max(p_hc_away - 0.5, 0.0),
+        }
+    )
+
+
+def quantile_bucket_edges(values: pd.Series, bucket_count: int = RESIDUAL_QUANTILE_BUCKETS) -> np.ndarray:
+    """Create stable bucket edges from empirical quantiles, with open tails."""
+    clean_values = pd.Series(values).replace([np.inf, -np.inf], np.nan).dropna()
+    if clean_values.empty:
+        return np.array([-np.inf, np.inf], dtype=float)
+    raw_edges = clean_values.quantile(np.linspace(0.0, 1.0, bucket_count + 1)).to_numpy(dtype=float)
+    raw_edges = np.unique(raw_edges)
+    if raw_edges.size <= 1:
+        return np.array([-np.inf, np.inf], dtype=float)
+    raw_edges[0] = -np.inf
+    raw_edges[-1] = np.inf
+    return raw_edges.astype(float)
+
+
+def assign_bucket_codes(values: pd.Series, edges: np.ndarray) -> pd.Series:
+    """Map continuous values into integer bucket codes defined by quantile edges."""
+    if len(edges) <= 2:
+        return pd.Series(np.zeros(len(values), dtype=int), index=values.index)
+    bucket_codes = pd.cut(values, bins=edges, labels=False, include_lowest=True)
+    return bucket_codes.astype("float").fillna(0).astype(int)
+
+
+def fit_residual_quantile_lookup(
+    calibration_rows: pd.DataFrame,
+    prediction_col: str,
+    actual_col: str,
+    certainty_col: str,
+    rolling_std_col: str,
+    gap_col: str,
+    side_name: str,
+) -> dict[str, object]:
+    """Fit fallback residual-quantile lookup tables from partition-A rows."""
+    work = calibration_rows[
+        [prediction_col, actual_col, certainty_col, rolling_std_col, gap_col]
+    ].copy()
+    work = work.replace([np.inf, -np.inf], np.nan)
+    work[certainty_col] = work[certainty_col].fillna(0.0)
+    work[rolling_std_col] = work[rolling_std_col].fillna(work[rolling_std_col].median())
+    work[rolling_std_col] = work[rolling_std_col].fillna(0.0)
+    work[gap_col] = work[gap_col].fillna(0.0)
+    work["residual"] = work[actual_col] - work[prediction_col]
+
+    bucket_specs = {
+        "predicted_mean_bucket": quantile_bucket_edges(work[prediction_col]),
+        "market_certainty_bucket": quantile_bucket_edges(work[certainty_col]),
+        "rolling_std_bucket": quantile_bucket_edges(work[rolling_std_col]),
+        "market_gap_bucket": quantile_bucket_edges(work[gap_col]),
+    }
+    for bucket_name, edges in bucket_specs.items():
+        source_col = {
+            "predicted_mean_bucket": prediction_col,
+            "market_certainty_bucket": certainty_col,
+            "rolling_std_bucket": rolling_std_col,
+            "market_gap_bucket": gap_col,
+        }[bucket_name]
+        work[bucket_name] = assign_bucket_codes(work[source_col], edges)
+
+    lookup_levels = [
+        ("full", ["predicted_mean_bucket", "market_certainty_bucket", "rolling_std_bucket", "market_gap_bucket"]),
+        ("no_gap", ["predicted_mean_bucket", "market_certainty_bucket", "rolling_std_bucket"]),
+        ("mean_cert", ["predicted_mean_bucket", "market_certainty_bucket"]),
+        ("mean_only", ["predicted_mean_bucket"]),
+    ]
+
+    lookup_tables: list[dict[str, object]] = []
+    for level_name, group_cols in lookup_levels:
+        rows: list[tuple[tuple[int, ...], dict[str, float]]] = []
+        grouped = work.groupby(group_cols, observed=True)["residual"]
+        for key, residuals in grouped:
+            if len(residuals) < RESIDUAL_QUANTILE_MIN_GROUP:
+                continue
+            if not isinstance(key, tuple):
+                key = (int(key),)
+            rows.append(
+                (
+                    tuple(int(item) for item in key),
+                    {
+                        "q10": float(residuals.quantile(RESIDUAL_QUANTILES[0])),
+                        "q50": float(residuals.quantile(RESIDUAL_QUANTILES[1])),
+                        "q90": float(residuals.quantile(RESIDUAL_QUANTILES[2])),
+                        "n": int(len(residuals)),
+                    },
+                )
+            )
+        lookup_tables.append({"name": level_name, "group_cols": group_cols, "mapping": dict(rows)})
+
+    global_residual = work["residual"]
+    global_quantiles = {
+        "q10": float(global_residual.quantile(RESIDUAL_QUANTILES[0])),
+        "q50": float(global_residual.quantile(RESIDUAL_QUANTILES[1])),
+        "q90": float(global_residual.quantile(RESIDUAL_QUANTILES[2])),
+        "n": int(len(global_residual)),
+    }
+    print(
+        f"{side_name} residual quantile lookup fitted on {len(work)} rows | "
+        f"levels={[(item['name'], len(item['mapping'])) for item in lookup_tables]}"
+    )
+    return {
+        "prediction_col": prediction_col,
+        "certainty_col": certainty_col,
+        "rolling_std_col": rolling_std_col,
+        "gap_col": gap_col,
+        "bucket_edges": bucket_specs,
+        "tables": lookup_tables,
+        "global": global_quantiles,
+    }
+
+
+def apply_residual_quantile_lookup(
+    target_rows: pd.DataFrame,
+    lookup: dict[str, object],
+) -> pd.DataFrame:
+    """Apply one fitted residual-quantile lookup to any target rows."""
+    work = target_rows.copy()
+    prediction_col = str(lookup["prediction_col"])
+    certainty_col = str(lookup["certainty_col"])
+    rolling_std_col = str(lookup["rolling_std_col"])
+    gap_col = str(lookup["gap_col"])
+
+    fill_values = {
+        certainty_col: 0.0,
+        rolling_std_col: 0.0,
+        gap_col: 0.0,
+    }
+    for source_col, fill_value in fill_values.items():
+        work[source_col] = work[source_col].replace([np.inf, -np.inf], np.nan).fillna(fill_value)
+
+    for bucket_name, edges in lookup["bucket_edges"].items():
+        source_col = {
+            "predicted_mean_bucket": prediction_col,
+            "market_certainty_bucket": certainty_col,
+            "rolling_std_bucket": rolling_std_col,
+            "market_gap_bucket": gap_col,
+        }[bucket_name]
+        work[bucket_name] = assign_bucket_codes(work[source_col], edges)
+
+    q10_values: list[float] = []
+    q50_values: list[float] = []
+    q90_values: list[float] = []
+    level_names: list[str] = []
+
+    for _, row in work.iterrows():
+        quantiles = None
+        level_name = "global"
+        for table in lookup["tables"]:
+            key = tuple(int(row[group_col]) for group_col in table["group_cols"])
+            quantiles = table["mapping"].get(key)
+            if quantiles is not None:
+                level_name = str(table["name"])
+                break
+        if quantiles is None:
+            quantiles = lookup["global"]
+        base_prediction = float(row[prediction_col])
+        quantile_triplet = np.array(
+            [
+                max(base_prediction + float(quantiles["q10"]), 0.1),
+                max(base_prediction + float(quantiles["q50"]), 0.1),
+                max(base_prediction + float(quantiles["q90"]), 0.1),
+            ],
+            dtype=float,
+        )
+        quantile_triplet.sort()
+        q10_values.append(float(quantile_triplet[0]))
+        q50_values.append(float(quantile_triplet[1]))
+        q90_values.append(float(quantile_triplet[2]))
+        level_names.append(level_name)
+
+    result = pd.DataFrame(index=work.index)
+    result["q10"] = q10_values
+    result["q50"] = q50_values
+    result["q90"] = q90_values
+    result["lookup_level"] = level_names
+    result["quantile_variance"] = np.maximum(((result["q90"] - result["q10"]) / NORMAL_Q10_Q90_SPAN) ** 2, 1e-6)
+    return result
+
+
+def attach_market_quantile_features(
+    betting_match_features: pd.DataFrame,
+    predicted_home_bet: np.ndarray,
+    predicted_away_bet: np.ndarray,
+    global_std_c: float,
+) -> pd.DataFrame:
+    """Build market abstractions and conditional residual quantiles from A, then apply them to B."""
+    enriched = betting_match_features.copy()
+    enriched["predicted_home_mean"] = predicted_home_bet
+    enriched["predicted_away_mean"] = predicted_away_bet
+    enriched["predicted_total_mean"] = predicted_home_bet + predicted_away_bet
+    enriched["predicted_diff_mean"] = predicted_home_bet - predicted_away_bet
+    enriched["home_cf_std_l20"] = enriched["home_cf_std_l20"].fillna(global_std_c)
+    enriched["away_cf_std_l20"] = enriched["away_cf_std_l20"].fillna(global_std_c)
+
+    if "market_target_home" not in enriched.columns or "market_target_away" not in enriched.columns:
+        inferred = enriched.apply(infer_market_means_for_row, axis=1)
+        enriched["market_target_home"] = [item[0] if item is not None else np.nan for item in inferred]
+        enriched["market_target_away"] = [item[1] if item is not None else np.nan for item in inferred]
+
+    market_features = enriched.apply(compute_market_feature_row, axis=1)
+    enriched = pd.concat([enriched, market_features], axis=1)
+
+    a_mask = enriched["partition"] == "A"
+    b_mask = enriched["partition"] == "B"
+    partition_a = enriched.loc[a_mask].sort_values("date_time").copy()
+    partition_b = enriched.loc[b_mask].sort_values("date_time").copy()
+    n_splits = min(4, max(2, len(partition_a) // 120))
+    tscv = TimeSeriesSplit(n_splits=n_splits) if len(partition_a) >= 240 else None
+
+    side_specs = [
+        {
+            "side_name": "home",
+            "prediction_col": "predicted_home_mean",
+            "actual_col": "home_corners",
+            "rolling_std_col": "home_cf_std_l20",
+            "gap_col": "market_vs_model_home_gap",
+            "output_cols": ("pred_home_q10", "pred_home_q50", "pred_home_q90", "quantile_sigma2_home", "quantile_lookup_level_home"),
+        },
+        {
+            "side_name": "away",
+            "prediction_col": "predicted_away_mean",
+            "actual_col": "away_corners",
+            "rolling_std_col": "away_cf_std_l20",
+            "gap_col": "market_vs_model_away_gap",
+            "output_cols": ("pred_away_q10", "pred_away_q50", "pred_away_q90", "quantile_sigma2_away", "quantile_lookup_level_away"),
+        },
+    ]
+
+    print_heading("Market Features")
+    print(
+        "Exported market abstractions:\n"
+        "- no-vig probs: market_prob_1x2_*, market_prob_ou_*, market_prob_hc_*\n"
+        "- market centers: market_home_mean, market_away_mean, market_total_mean, market_diff_mean\n"
+        "- certainty / tails: market_total_certainty, market_side_certainty, market_handicap_certainty, "
+        "market_quantile_certainty, market_tail_width_proxy, market_upper_tail_*_proxy\n"
+        "- disagreement: market_vs_model_home_gap, market_vs_model_away_gap, market_vs_model_total_gap, market_vs_model_diff_gap"
+    )
+
+    for spec in side_specs:
+        q10_col, q50_col, q90_col, variance_col, level_col = spec["output_cols"]
+        certainty_col = "market_quantile_certainty"
+        oof_quantiles = pd.DataFrame(index=partition_a.index, columns=["q10", "q50", "q90", "lookup_level", "quantile_variance"])
+
+        if tscv is not None:
+            for train_idx, val_idx in tscv.split(partition_a):
+                fold_train = partition_a.iloc[train_idx]
+                fold_val = partition_a.iloc[val_idx]
+                lookup = fit_residual_quantile_lookup(
+                    fold_train,
+                    spec["prediction_col"],
+                    spec["actual_col"],
+                    certainty_col,
+                    spec["rolling_std_col"],
+                    spec["gap_col"],
+                    spec["side_name"],
+                )
+                fold_quantiles = apply_residual_quantile_lookup(fold_val, lookup)
+                oof_quantiles.loc[fold_val.index, :] = fold_quantiles[["q10", "q50", "q90", "lookup_level", "quantile_variance"]].values
+
+        final_lookup = fit_residual_quantile_lookup(
+            partition_a,
+            spec["prediction_col"],
+            spec["actual_col"],
+            certainty_col,
+            spec["rolling_std_col"],
+            spec["gap_col"],
+            spec["side_name"],
+        )
+        fill_quantiles_a = apply_residual_quantile_lookup(partition_a, final_lookup)
+        oof_quantiles = oof_quantiles.where(oof_quantiles.notna(), fill_quantiles_a)
+        holdout_quantiles_b = apply_residual_quantile_lookup(partition_b, final_lookup)
+
+        enriched.loc[partition_a.index, q10_col] = oof_quantiles["q10"].to_numpy(dtype=float)
+        enriched.loc[partition_a.index, q50_col] = oof_quantiles["q50"].to_numpy(dtype=float)
+        enriched.loc[partition_a.index, q90_col] = oof_quantiles["q90"].to_numpy(dtype=float)
+        enriched.loc[partition_a.index, variance_col] = oof_quantiles["quantile_variance"].to_numpy(dtype=float)
+        enriched.loc[partition_a.index, level_col] = oof_quantiles["lookup_level"].astype(str).values
+
+        enriched.loc[partition_b.index, q10_col] = holdout_quantiles_b["q10"].to_numpy(dtype=float)
+        enriched.loc[partition_b.index, q50_col] = holdout_quantiles_b["q50"].to_numpy(dtype=float)
+        enriched.loc[partition_b.index, q90_col] = holdout_quantiles_b["q90"].to_numpy(dtype=float)
+        enriched.loc[partition_b.index, variance_col] = holdout_quantiles_b["quantile_variance"].to_numpy(dtype=float)
+        enriched.loc[partition_b.index, level_col] = holdout_quantiles_b["lookup_level"].astype(str).values
+
+        actual_a = partition_a[spec["actual_col"]].to_numpy(dtype=float)
+        base_a = partition_a[spec["prediction_col"]].to_numpy(dtype=float)
+        actual_b = partition_b[spec["actual_col"]].to_numpy(dtype=float)
+        base_b = partition_b[spec["prediction_col"]].to_numpy(dtype=float)
+        q50_a = enriched.loc[partition_a.index, q50_col].to_numpy(dtype=float)
+        q50_b = enriched.loc[partition_b.index, q50_col].to_numpy(dtype=float)
+        q10_b = enriched.loc[partition_b.index, q10_col].to_numpy(dtype=float)
+        q90_b = enriched.loc[partition_b.index, q90_col].to_numpy(dtype=float)
+        coverage_b = float(np.mean((actual_b >= q10_b) & (actual_b <= q90_b))) if len(actual_b) else np.nan
+        print(
+            f"{spec['side_name']} quantile diagnostics | "
+            f"A MAE base={mean_absolute_error(actual_a, base_a):.4f} q50={mean_absolute_error(actual_a, q50_a):.4f} | "
+            f"B MAE base={mean_absolute_error(actual_b, base_b):.4f} q50={mean_absolute_error(actual_b, q50_b):.4f} | "
+            f"B 10-90 coverage={coverage_b:.3f}"
+        )
+
+    return enriched
 
 
 def fit_market_teacher(
@@ -555,6 +928,14 @@ def build_match_features(
             "od": "ou_line",
         }
     )
+    hc = betting[betting["odds_type"] == "HC"].drop_duplicates("match_id")[["match_id", "oh", "oa", "od"]].copy()
+    hc = hc.rename(
+        columns={
+            "oh": "hc_home_price",
+            "oa": "hc_away_price",
+            "od": "hc_line",
+        }
+    )
 
     betting_match_features = (
         betting_matches.merge(bet_h, on="match_id", how="left")
@@ -562,6 +943,7 @@ def build_match_features(
         .merge(strength_features, on="match_id", how="left")
         .merge(x12, on="match_id", how="left")
         .merge(ou, on="match_id", how="left")
+        .merge(hc, on="match_id", how="left")
         .sort_values(["date_time", "competition_id"])
         .reset_index(drop=True)
     )
@@ -610,6 +992,9 @@ def fill_missing_features(
         "ou_over_price",
         "ou_under_price",
         "ou_line",
+        "hc_home_price",
+        "hc_away_price",
+        "hc_line",
     }
 
     train_feat_cols = [col for col in features.columns if col not in meta_cols]
@@ -1360,8 +1745,59 @@ def save_outputs(
     val_pred["pred_away"] = predicted_away_val
     val_path = write_csv_with_fallback(val_pred, output_dir / "q1_validation_predictions.csv")
 
+    export_cols = [
+        "match_id",
+        "date_time",
+        "competition_id",
+        "season_id",
+        "home_corners",
+        "away_corners",
+        "partition",
+        "p1x2_home_price",
+        "p1x2_away_price",
+        "p1x2_draw_price",
+        "ou_over_price",
+        "ou_under_price",
+        "ou_line",
+        "hc_home_price",
+        "hc_away_price",
+        "hc_line",
+        "market_prob_1x2_home",
+        "market_prob_1x2_away",
+        "market_prob_1x2_draw",
+        "market_prob_ou_over",
+        "market_prob_ou_under",
+        "market_prob_hc_home",
+        "market_prob_hc_away",
+        "market_home_mean",
+        "market_away_mean",
+        "market_total_mean",
+        "market_diff_mean",
+        "market_total_certainty",
+        "market_side_certainty",
+        "market_handicap_certainty",
+        "market_quantile_certainty",
+        "market_draw_prob",
+        "market_vs_model_home_gap",
+        "market_vs_model_away_gap",
+        "market_vs_model_total_gap",
+        "market_vs_model_diff_gap",
+        "market_tail_width_proxy",
+        "market_upper_tail_home_proxy",
+        "market_upper_tail_away_proxy",
+        "pred_home_q10",
+        "pred_home_q50",
+        "pred_home_q90",
+        "pred_away_q10",
+        "pred_away_q50",
+        "pred_away_q90",
+        "quantile_sigma2_home",
+        "quantile_sigma2_away",
+        "quantile_lookup_level_home",
+        "quantile_lookup_level_away",
+    ]
     bet_pred = betting_match_features[
-        ["match_id", "date_time", "competition_id", "season_id", "home_corners", "away_corners", "partition"]
+        [col for col in export_cols if col in betting_match_features.columns]
     ].copy()
     bet_pred["pred_home_corners"] = predicted_home_bet
     bet_pred["pred_away_corners"] = predicted_away_bet
@@ -1452,6 +1888,12 @@ def run_pipeline(data_dir: str | Path = ".", save_outputs_flag: bool = True, mak
         betting_match_features,
         predicted_home_bet,
         predicted_away_bet,
+    )
+    betting_match_features = attach_market_quantile_features(
+        betting_match_features,
+        predicted_home_bet,
+        predicted_away_bet,
+        global_std_c,
     )
     predicted_home_variance = calibration["dispersion_home"].predict(
         predicted_home_bet,
