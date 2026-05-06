@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 
 STAKE = 1.0
 DEFAULT_EV_THRESHOLD = 0.03
-DEFAULT_MARKET_THRESHOLDS = {"1X2": 0.040, "HC": 0.023, "OU": 0.030}
+DEFAULT_MARKET_THRESHOLDS = {"1X2": 0.030, "HC": 0.023, "OU": 0.030}
 DEFAULT_MONTE_CARLO_RUNS = 10_000
 CALIBRATION_MIN_SAMPLES = 120
 CALIBRATION_SHRINKAGE = 500.0
@@ -26,14 +26,6 @@ TAIL_SHRINK_MARKETS = ("1X2", "HC")
 TAIL_SHRINK_MAX_LAMBDA = 6.0
 TAIL_SCALE_GRID = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00]
 NORMAL_Q10_Q90_SPAN = 2.5631031310892007
-DEFAULT_INITIAL_BANKROLL = 100.0
-MAX_FULL_KELLY_FRACTION = 0.10
-DEFAULT_STAKING_PLAN = {
-    "baseline_fixed": {"mode": "fixed", "fraction": 1.0},
-    "kelly_100": {"mode": "kelly", "fraction": 1.0},
-    "kelly_50": {"mode": "kelly", "fraction": 0.5},
-    "kelly_25": {"mode": "kelly", "fraction": 0.25},
-}
 
 
 @dataclass
@@ -47,7 +39,6 @@ class Q2Artifacts:
     partition_summary: pd.DataFrame
     tail_scale_report: pd.DataFrame
     run_summary: pd.DataFrame
-    staking_summary: pd.DataFrame
 
 
 def print_heading(title: str) -> None:
@@ -711,197 +702,6 @@ def summarize_market_calibration(raw_bets: pd.DataFrame, calibrated_bets: pd.Dat
     return pd.DataFrame(rows)
 
 
-def full_kelly_fraction(win_probability: np.ndarray, decimal_odds: np.ndarray) -> np.ndarray:
-    """Compute a practical full-Kelly bankroll fraction for decimal odds, capped per bet."""
-    net_odds = np.maximum(decimal_odds - 1.0, 1e-6)
-    raw_fraction = (win_probability * decimal_odds - 1.0) / net_odds
-    return np.clip(raw_fraction, 0.0, MAX_FULL_KELLY_FRACTION)
-
-
-def run_staking_path(
-    selected_bets: pd.DataFrame,
-    stake_mode: str,
-    fraction_scale: float,
-    initial_bankroll: float,
-) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Replay one realised bet sequence under fixed-stake or fractional Kelly sizing."""
-    path = selected_bets.sort_values("date_time").reset_index(drop=True).copy()
-    bankroll = float(initial_bankroll)
-    bankroll_before: list[float] = []
-    stake_sizes: list[float] = []
-    pnl_values: list[float] = []
-    bankroll_after: list[float] = []
-
-    full_fraction = full_kelly_fraction(path["p_tail"].to_numpy(dtype=float), path["odds"].to_numpy(dtype=float))
-    path["full_kelly_fraction"] = full_fraction
-    if stake_mode == "fixed":
-        target_fraction = np.zeros(len(path), dtype=float)
-    else:
-        target_fraction = np.clip(full_fraction * fraction_scale, 0.0, 1.0)
-    path["stake_fraction"] = target_fraction
-
-    for _, group in path.groupby("date_time", sort=True):
-        bankroll_group_start = bankroll
-        group_indices = group.index.to_list()
-        if stake_mode == "fixed":
-            group_stakes = np.repeat(STAKE * fraction_scale, len(group_indices)).astype(float)
-            total_group_stake = group_stakes.sum()
-            if total_group_stake > bankroll_group_start and total_group_stake > 0:
-                group_stakes *= bankroll_group_start / total_group_stake
-        else:
-            group_stakes = bankroll_group_start * target_fraction[group_indices]
-            total_group_stake = group_stakes.sum()
-            if total_group_stake > bankroll_group_start and total_group_stake > 0:
-                group_stakes *= bankroll_group_start / total_group_stake
-
-        group_profits = np.where(
-            group["won"].to_numpy(dtype=float) == 1.0,
-            group_stakes * (group["odds"].to_numpy(dtype=float) - 1.0),
-            -group_stakes,
-        )
-        bankroll += float(group_profits.sum())
-
-        for local_pos, group_index in enumerate(group_indices):
-            bankroll_before.append(bankroll_group_start)
-            stake_sizes.append(float(group_stakes[local_pos]))
-            pnl_values.append(float(group_profits[local_pos]))
-            bankroll_after.append(bankroll_group_start + float(np.sum(group_profits[: local_pos + 1])))
-
-    path["bankroll_before"] = bankroll_before
-    path["stake_size"] = stake_sizes
-    path["strategy_pnl"] = pnl_values
-    path["bankroll_after"] = bankroll_after
-    peak_bankroll = path["bankroll_after"].cummax() if len(path) else pd.Series(dtype=float)
-    drawdown = (path["bankroll_after"] - peak_bankroll) / peak_bankroll if len(path) else pd.Series(dtype=float)
-
-    total_staked = float(path["stake_size"].sum())
-    total_pnl = float(path["strategy_pnl"].sum())
-    ending_bankroll = float(bankroll)
-    summary = {
-        "bets": int(len(path)),
-        "total_staked": total_staked,
-        "total_pnl": total_pnl,
-        "turnover_roi": total_pnl / total_staked if total_staked else np.nan,
-        "ending_bankroll": ending_bankroll,
-        "bankroll_return": ending_bankroll / initial_bankroll - 1.0 if initial_bankroll else np.nan,
-        "max_drawdown": float(drawdown.min()) if len(path) else np.nan,
-        "average_stake": float(path["stake_size"].mean()) if len(path) else np.nan,
-        "median_stake": float(path["stake_size"].median()) if len(path) else np.nan,
-        "average_fraction": float(path["stake_fraction"].mean()) if len(path) else np.nan,
-    }
-    return path, summary
-
-
-def simulate_staking_distribution(
-    selected_bets: pd.DataFrame,
-    stake_mode: str,
-    fraction_scale: float,
-    initial_bankroll: float,
-    monte_carlo_runs: int,
-) -> dict[str, float]:
-    """Simulate final PnL and ending bankroll distribution under one staking plan."""
-    if selected_bets.empty:
-        return {
-            "mc_p5_pnl": np.nan,
-            "mc_p50_pnl": np.nan,
-            "mc_p95_pnl": np.nan,
-            "mc_p5_bankroll": np.nan,
-            "mc_p50_bankroll": np.nan,
-            "mc_p95_bankroll": np.nan,
-            "mc_positive_prob": np.nan,
-            "mc_actual_percentile": np.nan,
-            "simulated_total_pnl": np.array([], dtype=float),
-        }
-
-    rng = np.random.default_rng(42)
-    win_probability = selected_bets["p_tail"].to_numpy(dtype=float)
-    decimal_odds = selected_bets["odds"].to_numpy(dtype=float)
-    realised_wins = selected_bets["won"].to_numpy(dtype=float)
-    simulated_wins = rng.random((monte_carlo_runs, len(selected_bets))) < win_probability[None, :]
-    bankrolls = np.full(monte_carlo_runs, float(initial_bankroll), dtype=float)
-
-    full_fraction = full_kelly_fraction(win_probability, decimal_odds)
-    if stake_mode == "fixed":
-        per_bet_fraction = np.zeros(len(selected_bets), dtype=float)
-    else:
-        per_bet_fraction = np.clip(full_fraction * fraction_scale, 0.0, 1.0)
-
-    actual_path, actual_summary = run_staking_path(selected_bets, stake_mode, fraction_scale, initial_bankroll)
-    del actual_path
-
-    ordered_bets = selected_bets.sort_values("date_time").reset_index(drop=True)
-    date_groups = ordered_bets.groupby("date_time", sort=True).indices
-    for group_indices in date_groups.values():
-        group_indices = np.asarray(group_indices, dtype=int)
-        group_bankroll_start = bankrolls.copy()
-        if stake_mode == "fixed":
-            group_stakes = np.full((monte_carlo_runs, len(group_indices)), STAKE * fraction_scale, dtype=float)
-            stake_totals = group_stakes.sum(axis=1)
-            scale = np.where(stake_totals > group_bankroll_start, group_bankroll_start / np.maximum(stake_totals, 1e-12), 1.0)
-            group_stakes = group_stakes * scale[:, None]
-        else:
-            group_stakes = group_bankroll_start[:, None] * per_bet_fraction[group_indices][None, :]
-            stake_totals = group_stakes.sum(axis=1)
-            scale = np.where(stake_totals > group_bankroll_start, group_bankroll_start / np.maximum(stake_totals, 1e-12), 1.0)
-            group_stakes = group_stakes * scale[:, None]
-
-        group_odds = decimal_odds[group_indices][None, :]
-        group_wins = simulated_wins[:, group_indices]
-        group_profits = np.where(group_wins, group_stakes * (group_odds - 1.0), -group_stakes)
-        bankrolls = bankrolls + group_profits.sum(axis=1)
-
-    simulated_total_pnl = bankrolls - initial_bankroll
-    return {
-        "mc_p5_pnl": float(np.percentile(simulated_total_pnl, 5)),
-        "mc_p50_pnl": float(np.percentile(simulated_total_pnl, 50)),
-        "mc_p95_pnl": float(np.percentile(simulated_total_pnl, 95)),
-        "mc_p5_bankroll": float(np.percentile(bankrolls, 5)),
-        "mc_p50_bankroll": float(np.percentile(bankrolls, 50)),
-        "mc_p95_bankroll": float(np.percentile(bankrolls, 95)),
-        "mc_positive_prob": float((simulated_total_pnl > 0).mean()),
-        "mc_actual_percentile": float((simulated_total_pnl <= actual_summary["total_pnl"]).mean() * 100),
-        "simulated_total_pnl": simulated_total_pnl,
-    }
-
-
-def compare_staking_plans(
-    selected_bets: pd.DataFrame,
-    monte_carlo_runs: int,
-    initial_bankroll: float = DEFAULT_INITIAL_BANKROLL,
-) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    """Compare baseline fixed stakes with multiple Kelly fractions on the same selected bets."""
-    bet_paths: dict[str, pd.DataFrame] = {}
-    summary_rows: list[dict[str, float | str]] = []
-
-    for strategy_name, config in DEFAULT_STAKING_PLAN.items():
-        path, realised_summary = run_staking_path(
-            selected_bets,
-            stake_mode=str(config["mode"]),
-            fraction_scale=float(config["fraction"]),
-            initial_bankroll=initial_bankroll,
-        )
-        mc_summary = simulate_staking_distribution(
-            selected_bets,
-            stake_mode=str(config["mode"]),
-            fraction_scale=float(config["fraction"]),
-            initial_bankroll=initial_bankroll,
-            monte_carlo_runs=monte_carlo_runs,
-        )
-        bet_paths[strategy_name] = path
-        summary_rows.append(
-            {
-                "strategy": strategy_name,
-                "stake_mode": str(config["mode"]),
-                "fraction_scale": float(config["fraction"]),
-                **realised_summary,
-                **{key: value for key, value in mc_summary.items() if key != "simulated_total_pnl"},
-            }
-        )
-
-    summary = pd.DataFrame(summary_rows)
-    return bet_paths, summary
-
-
 def evaluate_selected_bets(selected_bets: pd.DataFrame, monte_carlo_runs: int) -> dict[str, float]:
     """Compute realised PnL, ROI, and Monte Carlo diagnostics for selected bets."""
     selected = selected_bets.copy()
@@ -1025,12 +825,10 @@ def save_q2_outputs(
     partition_a_bets: pd.DataFrame,
     partition_b_bets: pd.DataFrame,
     selected_bets: pd.DataFrame,
-    staking_paths: dict[str, pd.DataFrame],
     base_calibration_report: pd.DataFrame,
     partition_summary: pd.DataFrame,
     tail_scale_report: pd.DataFrame,
     run_summary: pd.DataFrame,
-    staking_summary: pd.DataFrame,
 ) -> None:
     """Persist Q2 tables for one run into the chosen output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1045,13 +843,10 @@ def save_q2_outputs(
     safe_write_csv(partition_a_bets, output_dir / "partition_a_bets.csv")
     safe_write_csv(partition_b_bets, output_dir / "partition_b_bets.csv")
     safe_write_csv(selected_bets, output_dir / "selected_bets.csv")
-    for strategy_name, path in staking_paths.items():
-        safe_write_csv(path, output_dir / f"{strategy_name}_bet_path.csv")
     safe_write_csv(base_calibration_report, output_dir / "base_calibration_report.csv")
     safe_write_csv(partition_summary, output_dir / "partition_summary.csv")
     safe_write_csv(tail_scale_report, output_dir / "tail_scale_report.csv")
     safe_write_csv(run_summary, output_dir / "run_summary.csv")
-    safe_write_csv(staking_summary, output_dir / "staking_summary.csv")
 
 
 def run_q2_pipeline(
@@ -1150,7 +945,6 @@ def run_q2_pipeline(
     selected_bets["cum_ev"] = (selected_bets["ev_tail"] * STAKE).cumsum()
 
     evaluation = evaluate_selected_bets(selected_bets, monte_carlo_runs)
-    staking_paths, staking_summary = compare_staking_plans(selected_bets, monte_carlo_runs)
     run_summary = pd.DataFrame(
         [
             {
@@ -1192,24 +986,6 @@ def run_q2_pipeline(
     print(f"MC 5th-95th pct    : [{evaluation['mc_p5']:+.2f}, {evaluation['mc_p95']:+.2f}]")
     print(f"P(positive PnL)    : {evaluation['mc_positive_prob']:.2%}")
     print(f"Actual percentile  : {evaluation['mc_actual_percentile']:.0f}th")
-    print_heading("Staking Comparison")
-    print(f"Kelly cap per bet : {MAX_FULL_KELLY_FRACTION:.1%} of bankroll")
-    print(
-        staking_summary[
-            [
-                "strategy",
-                "total_pnl",
-                "turnover_roi",
-                "ending_bankroll",
-                "bankroll_return",
-                "max_drawdown",
-                "mc_p50_pnl",
-                "mc_actual_percentile",
-            ]
-        ]
-        .round(4)
-        .to_string(index=False)
-    )
 
     if make_plots:
         plot_cumulative_pnl(selected_bets, result_path)
@@ -1221,12 +997,10 @@ def run_q2_pipeline(
         partition_a_final,
         partition_b_final,
         selected_bets,
-        staking_paths,
         base_calibration_report,
         partition_summary,
         tail_scale_report,
         run_summary,
-        staking_summary,
     )
 
     return Q2Artifacts(
@@ -1237,7 +1011,6 @@ def run_q2_pipeline(
         partition_summary=partition_summary,
         tail_scale_report=tail_scale_report,
         run_summary=run_summary,
-        staking_summary=staking_summary,
     )
 
 
