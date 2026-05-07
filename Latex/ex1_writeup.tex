@@ -30,7 +30,7 @@
 
 \par\vspace{0.25cm}
 
-Once that distribution is good enough, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better risk-adjusted profile, which matters more here than maximising terminal cash. Just as importantly, Kelly is highly sensitive to probability error, so stress testing is not optional.
+Once that distribution is good enough, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better Sharpe-ratio-like risk-adjusted profile, which matters more here than maximising cash. Just as importantly, Kelly is highly sensitive to probability error, so stress testing is not optional.
 
 \par\vspace{0.25cm}
 
@@ -493,11 +493,11 @@ The probability model behind the Kelly sizing was checked earlier with Monte Car
 
 So the realised outcome is better than the model median in this sample. That is encouraging, but it still does not prove that the EV is accurate. The Monte Carlo check is only an internal consistency test. It asks: if the model probabilities were correct, would the realised PnL look plausible? It does not establish that the probabilities are stable out of sample.
 
-To make the stress-test idea more concrete, I also plot one pessimistic scenario. In that scenario, I cut the model edge by shrinking each selected probability \(20\%\) toward the no-vig market probability:
+To make the stress-test idea more concrete, I also plot one pessimistic scenario. In that scenario, I cut the model edge by shrinking each selected probability about \(28\%\) toward the no-vig market probability:
 \[
-p_{\text{stress}} = p_{\text{market}} + 0.8\left(p_{\text{tail}} - p_{\text{market}}\right).
+p_{\text{stress}} = p_{\text{market}} + 0.72\left(p_{\text{tail}} - p_{\text{market}}\right).
 \]
-Under that stressed probability set, the Monte Carlo median falls to \(+199.32\), which sits around the 11th percentile of the original model distribution. This is a useful visual reminder that the current edge can look much less comfortable once the distribution is perturbed even mildly.
+Under that stressed probability set, the Monte Carlo median falls to \(+179.16\), which sits around the 5th percentile of the original model distribution. This is a useful visual reminder that the current edge can look much less comfortable once the distribution is perturbed even mildly.
 
 The more serious failure mode is distribution shift. If the home and away means drift, if the variance layer becomes too narrow, if the tails are mis-specified, or if the bookmaker market adapts, then the realised win rate can fall below the model probability. In that case Kelly can lose money fast because the stake is a direct function of estimated edge.
 
@@ -518,7 +518,7 @@ This is also why I prefer showing \(25\%\) and \(50\%\) Kelly alongside full Kel
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.82\textwidth]{../outputs/kelly_backtest/selection_edge_monte_carlo.png}
-\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets, with one stressed scenario overlaid. The stressed line uses a 20\% shrink toward market-implied probabilities to show how a mild edge haircut moves the portfolio into the lower part of the original model distribution.}
+\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets, with one stressed scenario overlaid. The stressed line uses an approximately 28\% shrink toward market-implied probabilities so that the stressed median lands near the 5th percentile of the original model distribution.}
 \end{figure}
 
 \end{document}
