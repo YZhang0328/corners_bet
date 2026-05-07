@@ -112,13 +112,13 @@ class TeamStrengthEstimator:
         self.prior_strength = prior_strength
         self.max_learning_rate = max_learning_rate
 
-        self.attack_rating: dict[int, float]      = defaultdict(float)
-        self.defence_leakiness: dict[int, float]  = defaultdict(float)
-        self.attack_at_home: dict[int, float]     = defaultdict(float)
-        self.defence_at_home: dict[int, float]    = defaultdict(float)
-        self.attack_at_away: dict[int, float]     = defaultdict(float)
-        self.defence_at_away: dict[int, float]    = defaultdict(float)
-        self.prior_match_count: dict[int, int]    = defaultdict(int)
+        self.overall_attack_rating: dict[int, float] = defaultdict(float)
+        self.overall_defence_leakiness: dict[int, float] = defaultdict(float)
+        self.home_attack_rating: dict[int, float] = defaultdict(float)
+        self.home_defence_leakiness: dict[int, float] = defaultdict(float)
+        self.away_attack_rating: dict[int, float] = defaultdict(float)
+        self.away_defence_leakiness: dict[int, float] = defaultdict(float)
+        self.prior_match_count: dict[int, int] = defaultdict(int)
 
     def _learning_rate(self, team_id: int) -> float:
         return (self.max_learning_rate * self.prior_strength
@@ -136,29 +136,29 @@ class TeamStrengthEstimator:
         ratings; venue-specific ratings are returned alongside so the
         GBT can split on either view.
         """
-        alpha_home = self.attack_rating[home_team_id]
-        delta_home = self.defence_leakiness[home_team_id]
-        alpha_away = self.attack_rating[away_team_id]
-        delta_away = self.defence_leakiness[away_team_id]
+        home_team_overall_attack = self.overall_attack_rating[home_team_id]
+        home_team_overall_defence = self.overall_defence_leakiness[home_team_id]
+        away_team_overall_attack = self.overall_attack_rating[away_team_id]
+        away_team_overall_defence = self.overall_defence_leakiness[away_team_id]
 
-        log_lambda_home = league_log_baseline_home + alpha_home + delta_away
-        log_lambda_away = league_log_baseline_away + alpha_away + delta_home
+        predicted_home_log_rate = league_log_baseline_home + home_team_overall_attack + away_team_overall_defence
+        predicted_away_log_rate = league_log_baseline_away + away_team_overall_attack + home_team_overall_defence
 
         return {
-            'home_attack_rating':      alpha_home,
-            'home_defence_leakiness':  delta_home,
-            'away_attack_rating':      alpha_away,
-            'away_defence_leakiness':  delta_away,
-            'home_attack_at_home':     self.attack_at_home[home_team_id],
-            'home_defence_at_home':    self.defence_at_home[home_team_id],
-            'away_attack_at_away':     self.attack_at_away[away_team_id],
-            'away_defence_at_away':    self.defence_at_away[away_team_id],
-            'log_lambda_home':         log_lambda_home,
-            'log_lambda_away':         log_lambda_away,
-            'strength_diff':           (alpha_home - delta_home) - (alpha_away - delta_away),
-            'venue_strength_diff':     ((self.attack_at_home[home_team_id] - self.defence_at_home[home_team_id])
-                                        - (self.attack_at_away[away_team_id] - self.defence_at_away[away_team_id])),
-            'prior_match_count_home':  self.prior_match_count[home_team_id],
+            'home_attack_rating':      home_team_overall_attack,
+            'home_defence_leakiness':  home_team_overall_defence,
+            'away_attack_rating':      away_team_overall_attack,
+            'away_defence_leakiness':  away_team_overall_defence,
+            'home_attack_at_home':     self.home_attack_rating[home_team_id],
+            'home_defence_at_home':    self.home_defence_leakiness[home_team_id],
+            'away_attack_at_away':     self.away_attack_rating[away_team_id],
+            'away_defence_at_away':    self.away_defence_leakiness[away_team_id],
+            'log_lambda_home':         predicted_home_log_rate,
+            'log_lambda_away':         predicted_away_log_rate,
+            'strength_diff':           (home_team_overall_attack - home_team_overall_defence) - (away_team_overall_attack - away_team_overall_defence),
+            'venue_strength_diff':     ((self.home_attack_rating[home_team_id] - self.home_defence_leakiness[home_team_id])
+                                        - (self.away_attack_rating[away_team_id] - self.away_defence_leakiness[away_team_id])),
+            'prior_match_count_home': self.prior_match_count[home_team_id],
             'prior_match_count_away':  self.prior_match_count[away_team_id],
             'league_log_baseline_home': league_log_baseline_home,
             'league_log_baseline_away': league_log_baseline_away,
@@ -178,35 +178,39 @@ class TeamStrengthEstimator:
         away team's at-away). Increments the prior match count for both
         teams.
         """
-        log_lambda_home_general = (league_log_baseline_home
-                                   + self.attack_rating[home_team_id]
-                                   + self.defence_leakiness[away_team_id])
-        log_lambda_away_general = (league_log_baseline_away
-                                   + self.attack_rating[away_team_id]
-                                   + self.defence_leakiness[home_team_id])
+        predicted_home_log_rate = (
+            league_log_baseline_home
+            + self.overall_attack_rating[home_team_id]
+            + self.overall_defence_leakiness[away_team_id]
+        )
+        predicted_away_log_rate = (
+            league_log_baseline_away
+            + self.overall_attack_rating[away_team_id]
+            + self.overall_defence_leakiness[home_team_id]
+        )
 
-        home_log_residual = np.log(home_corners + LOG_RESIDUAL_SMOOTHING) - log_lambda_home_general
-        away_log_residual = np.log(away_corners + LOG_RESIDUAL_SMOOTHING) - log_lambda_away_general
+        home_team_log_residual = np.log(home_corners + LOG_RESIDUAL_SMOOTHING) - predicted_home_log_rate
+        away_team_log_residual = np.log(away_corners + LOG_RESIDUAL_SMOOTHING) - predicted_away_log_rate
 
-        learning_rate_home = self._learning_rate(home_team_id)
-        learning_rate_away = self._learning_rate(away_team_id)
+        home_team_learning_rate = self._learning_rate(home_team_id)
+        away_team_learning_rate = self._learning_rate(away_team_id)
 
         # General (venue-pooled) ratings: each rate is alpha + delta, so
         # split the residual evenly so that both latents move by half
         # and the sum (the rate) moves by the full residual.
-        self.attack_rating[home_team_id]     += 0.5 * learning_rate_home * home_log_residual
-        self.defence_leakiness[away_team_id] += 0.5 * learning_rate_away * home_log_residual
-        self.attack_rating[away_team_id]     += 0.5 * learning_rate_away * away_log_residual
-        self.defence_leakiness[home_team_id] += 0.5 * learning_rate_home * away_log_residual
+        self.overall_attack_rating[home_team_id] += 0.5 * home_team_learning_rate * home_team_log_residual
+        self.overall_defence_leakiness[away_team_id] += 0.5 * away_team_learning_rate * home_team_log_residual
+        self.overall_attack_rating[away_team_id] += 0.5 * away_team_learning_rate * away_team_log_residual
+        self.overall_defence_leakiness[home_team_id] += 0.5 * home_team_learning_rate * away_team_log_residual
 
         # Venue-specific ratings: home team's at-home pair updates from
         # this match (they played at home), away team's at-away pair
         # updates from this match (they played away). The other team's
         # ratings at the *opposite* venue are untouched.
-        self.attack_at_home[home_team_id]    += 0.5 * learning_rate_home * home_log_residual
-        self.defence_at_home[home_team_id]   += 0.5 * learning_rate_home * away_log_residual
-        self.attack_at_away[away_team_id]    += 0.5 * learning_rate_away * away_log_residual
-        self.defence_at_away[away_team_id]   += 0.5 * learning_rate_away * home_log_residual
+        self.home_attack_rating[home_team_id] += 0.5 * home_team_learning_rate * home_team_log_residual
+        self.home_defence_leakiness[home_team_id] += 0.5 * home_team_learning_rate * away_team_log_residual
+        self.away_attack_rating[away_team_id] += 0.5 * away_team_learning_rate * away_team_log_residual
+        self.away_defence_leakiness[away_team_id] += 0.5 * away_team_learning_rate * home_team_log_residual
 
         self.prior_match_count[home_team_id] += 1
         self.prior_match_count[away_team_id] += 1

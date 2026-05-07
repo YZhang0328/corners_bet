@@ -29,8 +29,8 @@ NORMAL_Q10_Q90_SPAN = 2.5631031310892007
 
 
 @dataclass
-class Q2Artifacts:
-    """Container for the main Q2 intermediate and final tables."""
+class MarketBacktestArtifacts:
+    """Container for the main intermediate and final tables from the market backtest."""
 
     partition_a_bets: pd.DataFrame
     partition_b_bets: pd.DataFrame
@@ -42,12 +42,12 @@ class Q2Artifacts:
 
 
 def print_heading(title: str) -> None:
-    """Print a section header for Q2 console output."""
+    """Print a section header for market backtest console output."""
     print(f"\n=== {title} ===")
 
 
-def read_prediction_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load Q1 betting predictions, market prices, and observed results."""
+def load_prediction_and_market_tables(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load Q1 match predictions, quoted market prices, and realised match results."""
     latest_prediction_path = data_dir / "q1_betting_match_predictions.latest.csv"
     candidate_paths = [
         latest_prediction_path,
@@ -58,7 +58,7 @@ def read_prediction_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, 
     predicted_matches = pd.read_csv(prediction_path, parse_dates=["date_time"])
     market_prices = pd.read_csv(data_dir / "corners_prices.csv", parse_dates=["date_time"])
     observed_results = pd.read_csv(data_dir / "corners_prices_results.csv")
-    print_heading("Load Q2 Inputs")
+    print_heading("Load Backtest Inputs")
     print(
         f"predictions={prediction_path.name} rows={len(predicted_matches)} | "
         f"market rows={len(market_prices)} | result rows={len(observed_results)}"
@@ -66,24 +66,24 @@ def read_prediction_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, 
     return predicted_matches, market_prices, observed_results
 
 
-def attach_quantile_aware_distribution_inputs(predicted_matches: pd.DataFrame) -> pd.DataFrame:
-    """Attach quantile diagnostics while keeping raw Q1 mean/variance as the primary moments."""
+def attach_q1_distribution_columns(predicted_matches: pd.DataFrame) -> pd.DataFrame:
+    """Rename Q1 output columns into clearer distribution inputs for the betting layer."""
     prepared = predicted_matches.copy()
-    prepared["q2_home_center"] = prepared["pred_home_corners"]
-    prepared["q2_away_center"] = prepared["pred_away_corners"]
-    prepared["q2_home_variance"] = prepared["sigma2_home"]
-    prepared["q2_away_variance"] = prepared["sigma2_away"]
-    prepared["quantile_home_center"] = prepared.get("pred_home_q50", prepared["pred_home_corners"])
-    prepared["quantile_away_center"] = prepared.get("pred_away_q50", prepared["pred_away_corners"])
-    prepared["quantile_home_variance"] = prepared.get("quantile_sigma2_home", prepared["sigma2_home"])
-    prepared["quantile_away_variance"] = prepared.get("quantile_sigma2_away", prepared["sigma2_away"])
+    prepared["predicted_home_corner_mean"] = prepared["pred_home_corners"]
+    prepared["predicted_away_corner_mean"] = prepared["pred_away_corners"]
+    prepared["predicted_home_corner_variance"] = prepared["sigma2_home"]
+    prepared["predicted_away_corner_variance"] = prepared["sigma2_away"]
+    prepared["quantile_home_corner_median"] = prepared.get("pred_home_q50", prepared["pred_home_corners"])
+    prepared["quantile_away_corner_median"] = prepared.get("pred_away_q50", prepared["pred_away_corners"])
+    prepared["quantile_home_corner_variance"] = prepared.get("quantile_sigma2_home", prepared["sigma2_home"])
+    prepared["quantile_away_corner_variance"] = prepared.get("quantile_sigma2_away", prepared["sigma2_away"])
 
     print_heading("Quantile-Aware Moments")
     print(
-        f"q50 coverage home={prepared['quantile_home_center'].notna().mean():.1%} "
-        f"away={prepared['quantile_away_center'].notna().mean():.1%} | "
-        f"median quantile/raw variance ratio home={np.median(prepared['quantile_home_variance'] / prepared['sigma2_home']):.3f} "
-        f"away={np.median(prepared['quantile_away_variance'] / prepared['sigma2_away']):.3f}"
+        f"q50 coverage home={prepared['quantile_home_corner_median'].notna().mean():.1%} "
+        f"away={prepared['quantile_away_corner_median'].notna().mean():.1%} | "
+        f"median quantile/raw variance ratio home={np.median(prepared['quantile_home_corner_variance'] / prepared['sigma2_home']):.3f} "
+        f"away={np.median(prepared['quantile_away_corner_variance'] / prepared['sigma2_away']):.3f}"
     )
     return prepared
 
@@ -134,14 +134,14 @@ def quantile_tail_distance(prediction_row: pd.Series, market_type: str, market_l
     return max(abs(diff_q50) - half_width, 0.0) / half_width
 
 
-def estimate_shared_correlation(calibration_matches: pd.DataFrame) -> dict[str, float]:
+def estimate_home_away_corner_correlation(calibration_matches: pd.DataFrame) -> dict[str, float]:
     """Estimate one shared home-away corner correlation from partition A."""
     clean_rows = calibration_matches.dropna(
         subset=[
-            "q2_home_center",
-            "q2_away_center",
-            "q2_home_variance",
-            "q2_away_variance",
+            "predicted_home_corner_mean",
+            "predicted_away_corner_mean",
+            "predicted_home_corner_variance",
+            "predicted_away_corner_variance",
             "home_corners",
             "away_corners",
         ]
@@ -149,12 +149,15 @@ def estimate_shared_correlation(calibration_matches: pd.DataFrame) -> dict[str, 
     if clean_rows.empty:
         return {"rho": -0.20, "k_total": np.nan, "k_diff": np.nan, "n": 0}
 
-    independent_variance = clean_rows["q2_home_variance"] + clean_rows["q2_away_variance"]
-    covariance_term = np.sqrt(np.maximum(clean_rows["q2_home_variance"], 1e-6) * np.maximum(clean_rows["q2_away_variance"], 1e-6))
+    independent_variance = clean_rows["predicted_home_corner_variance"] + clean_rows["predicted_away_corner_variance"]
+    covariance_term = np.sqrt(
+        np.maximum(clean_rows["predicted_home_corner_variance"], 1e-6)
+        * np.maximum(clean_rows["predicted_away_corner_variance"], 1e-6)
+    )
     actual_total = clean_rows["home_corners"] + clean_rows["away_corners"]
-    predicted_total = clean_rows["q2_home_center"] + clean_rows["q2_away_center"]
+    predicted_total = clean_rows["predicted_home_corner_mean"] + clean_rows["predicted_away_corner_mean"]
     actual_diff = clean_rows["home_corners"] - clean_rows["away_corners"]
-    predicted_diff = clean_rows["q2_home_center"] - clean_rows["q2_away_center"]
+    predicted_diff = clean_rows["predicted_home_corner_mean"] - clean_rows["predicted_away_corner_mean"]
 
     total_residual_variance = float(np.mean((actual_total - predicted_total) ** 2))
     diff_residual_variance = float(np.mean((actual_diff - predicted_diff) ** 2))
@@ -172,8 +175,8 @@ def estimate_shared_correlation(calibration_matches: pd.DataFrame) -> dict[str, 
     }
 
 
-def negative_binomial_params(predicted_mean: float, predicted_variance: float) -> tuple[float, float]:
-    """Convert count moments into scipy's negative-binomial parameterization."""
+def negative_binomial_parameters_from_moments(predicted_mean: float, predicted_variance: float) -> tuple[float, float]:
+    """Convert a mean/variance pair into scipy's negative-binomial parameterization."""
     stable_mean = float(np.maximum(predicted_mean, 1e-6))
     stable_variance = float(np.maximum(predicted_variance, stable_mean + 1e-6))
     success_prob = stable_mean / stable_variance
@@ -235,7 +238,7 @@ def probability_total_over(
     )
     max_corners = max(int(np.ceil(quoted_line)) + 20, int(predicted_total + 6 * np.sqrt(predicted_total_variance)) + 1)
     corner_grid = np.arange(0, max_corners + 1)
-    total_size, total_prob = negative_binomial_params(predicted_total, predicted_total_variance)
+    total_size, total_prob = negative_binomial_parameters_from_moments(predicted_total, predicted_total_variance)
     total_distribution = nbinom.pmf(corner_grid, total_size, total_prob)
     return float(np.clip(total_distribution[corner_grid > quoted_line].sum(), 0.0, 1.0))
 
@@ -288,12 +291,12 @@ def quoted_market_line(price_row: pd.Series) -> float:
     return float(price_row["od"]) if price_row["odds_type"] in {"OU", "HC"} else 0.0
 
 
-def market_outcome_probabilities(prediction_row: pd.Series, price_row: pd.Series, shared_rho: float) -> dict[str, float]:
-    """Turn one Q1 prediction row into market outcome probabilities."""
-    predicted_home_corners = float(prediction_row["q2_home_center"])
-    predicted_away_corners = float(prediction_row["q2_away_center"])
-    predicted_home_variance = float(prediction_row["q2_home_variance"])
-    predicted_away_variance = float(prediction_row["q2_away_variance"])
+def model_market_outcome_probabilities(prediction_row: pd.Series, price_row: pd.Series, shared_rho: float) -> dict[str, float]:
+    """Turn one Q1 prediction row into model probabilities for one quoted market."""
+    predicted_home_corners = float(prediction_row["predicted_home_corner_mean"])
+    predicted_away_corners = float(prediction_row["predicted_away_corner_mean"])
+    predicted_home_variance = float(prediction_row["predicted_home_corner_variance"])
+    predicted_away_variance = float(prediction_row["predicted_away_corner_variance"])
     market_type = price_row["odds_type"]
     market_line = quoted_market_line(price_row)
 
@@ -370,7 +373,7 @@ def market_outcome_probabilities(prediction_row: pd.Series, price_row: pd.Series
     }
 
 
-def build_candidate_side_rows(
+def build_candidate_bet_rows(
     prediction_rows: pd.DataFrame,
     market_prices: pd.DataFrame,
     shared_rho: float,
@@ -391,7 +394,7 @@ def build_candidate_side_rows(
         if market_type in {"OU", "HC"} and pd.isna(price_row["od"]):
             continue
         market_line = quoted_market_line(price_row)
-        quoted_probabilities = market_outcome_probabilities(prediction_row, price_row, shared_rho)
+        quoted_probabilities = model_market_outcome_probabilities(prediction_row, price_row, shared_rho)
         market_group_id = f"{match_id}|{market_type}|{market_line}"
         quoted_odds = {
             "OU": {"over": price_row["oh"], "under": price_row["oa"]},
@@ -470,8 +473,8 @@ def log_loss_score(actual: pd.Series | np.ndarray, predicted_probability: pd.Ser
     return float(-np.mean(actual_array * np.log(probability_array) + (1 - actual_array) * np.log(1 - probability_array)))
 
 
-def fit_isotonic_side_calibrators(training_bets: pd.DataFrame) -> tuple[dict[str, dict[str, object]], pd.DataFrame]:
-    """Fit per-market-side isotonic calibrators on partition A."""
+def fit_side_probability_calibrators(training_bets: pd.DataFrame) -> tuple[dict[str, dict[str, object]], pd.DataFrame]:
+    """Fit per-side isotonic probability calibrators on partition A."""
     calibrators: dict[str, dict[str, object]] = {}
     report_rows: list[dict[str, object]] = []
     training_rows = training_bets.dropna(subset=["p_raw", "won"]).copy()
@@ -515,7 +518,7 @@ def fit_isotonic_side_calibrators(training_bets: pd.DataFrame) -> tuple[dict[str
     return calibrators, report
 
 
-def apply_base_probability_calibration(candidate_bets: pd.DataFrame, calibrators: dict[str, dict[str, object]]) -> pd.DataFrame:
+def apply_side_probability_calibration(candidate_bets: pd.DataFrame, calibrators: dict[str, dict[str, object]]) -> pd.DataFrame:
     """Apply the per-side isotonic calibration and renormalize within each market."""
     calibrated = candidate_bets.copy()
     calibrated["calibration_key"] = calibrated["odds_type"] + "|" + calibrated["side"]
@@ -541,7 +544,7 @@ def apply_base_probability_calibration(candidate_bets: pd.DataFrame, calibrators
     return calibrated
 
 
-def attach_no_vig_market_probabilities(candidate_bets: pd.DataFrame) -> pd.DataFrame:
+def attach_market_no_vig_probabilities(candidate_bets: pd.DataFrame) -> pd.DataFrame:
     """Convert decimal odds inside each market into no-vig reference probabilities."""
     with_market_probs = candidate_bets.copy()
     with_market_probs["inv_odds"] = np.where(with_market_probs["bettable"], 1.0 / with_market_probs["odds"], np.nan)
@@ -755,7 +758,7 @@ def plot_cumulative_pnl(selected_bets: pd.DataFrame, output_dir: Path) -> None:
     fig.autofmt_xdate()
     axis.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "q2_cumulative_pnl.png", dpi=150)
+    plt.savefig(output_dir / "market_backtest_cumulative_pnl.png", dpi=150)
     plt.close(fig)
 
 
@@ -787,7 +790,7 @@ def plot_rolling_pnl(selected_bets: pd.DataFrame, output_dir: Path) -> None:
     fig.autofmt_xdate()
     axis.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "q2_rolling_pnl.png", dpi=150)
+    plt.savefig(output_dir / "market_backtest_rolling_pnl.png", dpi=150)
     plt.close(fig)
 
 
@@ -816,11 +819,11 @@ def plot_monte_carlo_distribution(evaluation: dict[str, float], output_dir: Path
     axis.set_ylabel("Density")
     axis.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "q2_monte_carlo.png", dpi=150)
+    plt.savefig(output_dir / "market_backtest_monte_carlo.png", dpi=150)
     plt.close(fig)
 
 
-def save_q2_outputs(
+def save_backtest_outputs(
     output_dir: Path,
     partition_a_bets: pd.DataFrame,
     partition_b_bets: pd.DataFrame,
@@ -830,7 +833,7 @@ def save_q2_outputs(
     tail_scale_report: pd.DataFrame,
     run_summary: pd.DataFrame,
 ) -> None:
-    """Persist Q2 tables for one run into the chosen output directory."""
+    """Persist backtest tables for one run into the chosen output directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def safe_write_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -849,7 +852,7 @@ def save_q2_outputs(
     safe_write_csv(run_summary, output_dir / "run_summary.csv")
 
 
-def run_q2_pipeline(
+def run_market_betting_backtest(
     data_dir: str | Path = ".",
     ev_threshold: float | None = None,
     market_thresholds: dict[str, float] | None = None,
@@ -857,18 +860,18 @@ def run_q2_pipeline(
     output_dir: str | Path | None = None,
     evaluation_scope: str = "B",
     make_plots: bool = True,
-) -> Q2Artifacts:
-    """Run the full Q2 market-probability, calibration, and backtest pipeline."""
+) -> MarketBacktestArtifacts:
+    """Run the full market-probability, calibration, and backtest pipeline."""
     data_path = Path(data_dir)
     result_path = Path(output_dir) if output_dir is not None else data_path
     result_path.mkdir(parents=True, exist_ok=True)
     effective_thresholds = resolve_market_thresholds(ev_threshold, market_thresholds)
-    predicted_matches, market_prices, observed_results = read_prediction_inputs(data_path)
-    predicted_matches = attach_quantile_aware_distribution_inputs(predicted_matches)
+    predicted_matches, market_prices, observed_results = load_prediction_and_market_tables(data_path)
+    predicted_matches = attach_q1_distribution_columns(predicted_matches)
     partition_a_predictions = predicted_matches[predicted_matches["partition"] == "A"].copy()
     partition_b_predictions = predicted_matches[predicted_matches["partition"] == "B"].copy()
 
-    shared_rho_info = estimate_shared_correlation(partition_a_predictions)
+    shared_rho_info = estimate_home_away_corner_correlation(partition_a_predictions)
     print_heading("Shared Correlation")
     print(
         f"rho={shared_rho_info['rho']:.3f} from A only | "
@@ -878,11 +881,11 @@ def run_q2_pipeline(
     )
 
     partition_a_raw = attach_observed_outcomes(
-        build_candidate_side_rows(partition_a_predictions, market_prices, shared_rho_info["rho"], "A"),
+        build_candidate_bet_rows(partition_a_predictions, market_prices, shared_rho_info["rho"], "A"),
         observed_results,
     )
     partition_b_raw = attach_observed_outcomes(
-        build_candidate_side_rows(partition_b_predictions, market_prices, shared_rho_info["rho"], "B"),
+        build_candidate_bet_rows(partition_b_predictions, market_prices, shared_rho_info["rho"], "B"),
         observed_results,
     )
 
@@ -892,11 +895,11 @@ def run_q2_pipeline(
         f"B={len(partition_b_raw)} sides {partition_b_raw['odds_type'].value_counts().to_dict()}"
     )
 
-    base_calibrators, base_calibration_report = fit_isotonic_side_calibrators(partition_a_raw)
-    partition_a_calibrated = apply_base_probability_calibration(partition_a_raw, base_calibrators)
-    partition_b_calibrated = apply_base_probability_calibration(partition_b_raw, base_calibrators)
-    partition_a_calibrated = attach_no_vig_market_probabilities(partition_a_calibrated)
-    partition_b_calibrated = attach_no_vig_market_probabilities(partition_b_calibrated)
+    base_calibrators, base_calibration_report = fit_side_probability_calibrators(partition_a_raw)
+    partition_a_calibrated = apply_side_probability_calibration(partition_a_raw, base_calibrators)
+    partition_b_calibrated = apply_side_probability_calibration(partition_b_raw, base_calibrators)
+    partition_a_calibrated = attach_market_no_vig_probabilities(partition_a_calibrated)
+    partition_b_calibrated = attach_market_no_vig_probabilities(partition_b_calibrated)
 
     partition_summary = pd.concat(
         [
@@ -967,12 +970,12 @@ def run_q2_pipeline(
             }
         ]
     )
-    print_heading("Q2 Selection Summary")
+    print_heading("Selection Summary")
     print(f"Bets placed        : {evaluation['bets']}")
     print(f"Evaluation scope   : {evaluation_scope.upper()}")
     print(f"EV thresholds      : 1X2>{effective_thresholds['1X2']:.3f} HC>{effective_thresholds['HC']:.3f} OU>{effective_thresholds['OU']:.3f}")
     print(f"Breakdown by market: {selected_bets['odds_type'].value_counts().to_dict()}")
-    print_heading("Q2 Overall PnL / RoI")
+    print_heading("Overall PnL / RoI")
     print(f"Total staked       : {evaluation['bets'] * STAKE:.2f} units")
     print(f"Total PnL          : {evaluation['total_pnl']:+.2f} units")
     print(f"RoI                : {evaluation['roi']:+.2%}")
@@ -992,7 +995,7 @@ def run_q2_pipeline(
         plot_rolling_pnl(selected_bets, result_path)
         plot_monte_carlo_distribution(evaluation, result_path)
 
-    save_q2_outputs(
+    save_backtest_outputs(
         result_path,
         partition_a_final,
         partition_b_final,
@@ -1003,7 +1006,7 @@ def run_q2_pipeline(
         run_summary,
     )
 
-    return Q2Artifacts(
+    return MarketBacktestArtifacts(
         partition_a_bets=partition_a_final,
         partition_b_bets=partition_b_final,
         selected_bets=selected_bets,
@@ -1015,8 +1018,8 @@ def run_q2_pipeline(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the standalone Q2 runner."""
-    parser = argparse.ArgumentParser(description="Run the Q2 calibration and betting backtest pipeline.")
+    """Parse command-line arguments for the standalone market backtest runner."""
+    parser = argparse.ArgumentParser(description="Run the market calibration and betting backtest pipeline.")
     parser.add_argument("--data-dir", default=".", help="Directory containing Q1 outputs and market price files.")
     parser.add_argument(
         "--ev-threshold",
@@ -1033,7 +1036,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MONTE_CARLO_RUNS,
         help="Number of Monte Carlo paths for the PnL simulation.",
     )
-    parser.add_argument("--output-dir", default=".", help="Directory where Q2 result files and plots should be written.")
+    parser.add_argument("--output-dir", default=".", help="Directory where backtest result files and plots should be written.")
     parser.add_argument(
         "--evaluation-scope",
         default="B",
@@ -1053,7 +1056,7 @@ if __name__ == "__main__":
             "HC": cli_args.threshold_hc,
             "OU": cli_args.threshold_ou,
         }
-    run_q2_pipeline(
+    run_market_betting_backtest(
         data_dir=cli_args.data_dir,
         ev_threshold=cli_args.ev_threshold,
         market_thresholds=cli_market_thresholds,

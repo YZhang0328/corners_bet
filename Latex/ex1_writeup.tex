@@ -1,0 +1,496 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{Ex1 Writeup}
+\author{}
+\date{}
+
+\begin{document}
+
+\begin{flushright}
+    \textbf{\small Yujia Zhang \\
+    \today}
+\end{flushright}
+
+\begin{center}
+    \textbf{\large Exercise Solution}
+\end{center}
+
+\begin{flushleft}
+\vspace{0.3cm}
+
+{\itshape
+\textbf{Summary:} Predicting exact home and away corners is hard, so the model should not stop at point forecasts. The useful step is to combine home and away means, variances, and market-aware calibration into a betting distribution.
+
+\par\vspace{0.25cm}
+
+Once that distribution is good enough, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better risk-adjusted profile, and in this setting that matters more than maximising cash. Just as importantly, Kelly is highly sensitive to probability error, so stress testing is not optional.
+
+\par\vspace{0.25cm}
+
+Questions 2 and 3 are standard at the formula level: EV, distributions, and Kelly are well known. The real issue is whether the model probabilities behind those formulas are believable. That is why the assumptions have to be checked, especially with Monte Carlo. 
+
+}
+
+\vspace{0.45cm}
+\end{flushleft}
+
+\noindent \textbf{Question 1. Build a predictive model for the number of home and away corners. Explain the process -
+including data exploration, features and model selection/comparison, model validation etc?}
+
+\noindent \textbf{Answer.} The Q1 path is:
+\[
+\texttt{data\_cleaning.ipynb}
+\rightarrow
+\texttt{q1\_pipeline.py}
+\]
+Inside \texttt{q1\_pipeline.py}, Stage 1a calls \texttt{team\_strength.py} and Stage 3 calls \texttt{team\_variance.py}. In practice the order is:
+\begin{enumerate}
+    \item \texttt{data\_cleaning.ipynb} does the data preprocessing.
+    \item \texttt{q1\_pipeline.py} loads those parquet files and builds the full Q1 dataset.
+    \item Stage 1a in \texttt{q1\_pipeline.py} calls \texttt{team\_strength.py} to build leak-free pre-match team strength features.
+    \item Stage 1b builds rolling recent-form features from earlier matches only.
+    \item Stage 2 fits the mean models for home corners and away corners.
+    \item Stage 3 calls \texttt{team\_variance.py} to estimate conditional variance, then applies the late-window correction, market-teacher adjustment (no odds are used in this stage), and residual quantile calibration.
+\end{enumerate}
+So \texttt{q1\_pipeline.py} is the orchestrator, while \texttt{team\_strength.py} and \texttt{team\_variance.py} are helper modules that produce two of the most important feature blocks.
+
+\bigskip
+
+\noindent \textbf{Data exploration:}
+
+\noindent See data\_cleaning.ipynb. It reads the raw CSV files, removes outliers (999 in corners data csv) and conflicting records, only keeps the first occurrence of the duplicate records. It also removes $<$ 1 odds for oh and oa, and negative od odds in "OU" and "1X2". After done these steps, 7 team's corner records are missing from corner data. These are filled by matching the records from the price tables (market odds are not involved in this stage). The clean tables are written to \texttt{train.parquet}, \texttt{betting.parquet}, and \texttt{all\_matches.parquet}.\\
+
+
+\noindent \textbf{What does Q1 actually predict for one match, and where do mean and variance enter?}
+
+\noindent Q1 makes two different kinds of prediction for each match.
+\begin{enumerate}
+    \item A \textbf{point forecast}: how many corners the home team is expected to win, and how many corners the away team is expected to win.
+    \item An \textbf{uncertainty forecast}: how much those two point forecasts are expected to vary around their centres.
+\end{enumerate}
+
+The point forecast is simply the pair
+\[
+\hat{\mu}_{home}=\texttt{pred\_home\_corners},\qquad
+\hat{\mu}_{away}=\texttt{pred\_away\_corners}.
+\]
+If the model says \(5.8\) and \(4.3\), then Q1's direct answer for that match is ``home about 5.8 corners, away about 4.3 corners.'' The variance does not create a second point forecast and it does not shift the mean. It only says how uncertain the model is around those centres.
+
+After the two means are predicted, I estimate one variance for the home prediction and one variance for the away prediction (later used in Q2). So the final Q1 output is:
+\[
+\hat{\mu}_{home},\;
+\hat{\mu}_{away},\;
+\hat{\sigma}^{2}_{home},\;
+\hat{\sigma}^{2}_{away},
+\]
+plus residual quantile anchors \(q10, q50, q90\) that will be also used by Q2.
+
+\bigskip
+
+\noindent \textbf{To predict the number of corners, I introduced a team-strength model as a sub-model of mean prediction, since team strength is a key determinant of corner output.}
+
+\noindent The team-strength block turns raw match history into a running estimate of each team's latent corner profile. It is best described as an \textbf{Elo-style online updater}, but it is not the classical Elo system used for win/loss results.
+
+In classical Elo, each team has one rating and the update is driven by whether the team won or lost. Here, each team carries two hidden states:
+\begin{itemize}
+    \item an attack rating: how much the team tends to create corners;
+    \item a defence leakiness rating: how many corners the team tends to allow.
+\end{itemize}
+The model walks through matches in chronological order. Before updating anything, it reads the current ratings and builds the features for that match. Only after the match is observed does it update the two teams' ratings. That detail matters, because it means every row only uses information that was available \emph{before kickoff}. There is no look-ahead leakage.
+
+The core abstraction is:
+\[
+\log(\lambda_{home})
+=
+\text{league home baseline}
++
+\text{home attack}
++
+\text{away defensive leakiness},
+\]
+\[
+\log(\lambda_{away})
+=
+\text{league away baseline}
++
+\text{away attack}
++
+\text{home defensive leakiness}.
+\]
+Here \(\lambda_{home}\) and \(\lambda_{away}\) are the expected home and away corner rates before the match starts. After the match ends, the model compares the realised corners with these expected rates on the log scale and nudges the two teams' latent ratings up or down. Teams with little history move faster. Teams with long history move more slowly. That is what the prior-strength and learning-rate terms are doing.
+
+So the Elo idea appears in the mechanics:
+\begin{itemize}
+    \item keep a running latent rating per team;
+    \item compare expectation with what really happened;
+    \item update the ratings after each match;
+    \item make updates smaller once the rating is supported by more history.
+\end{itemize}
+What changes is the target being updated. It is not the final match result. It is the team's corner-creation and corner-concession behaviour.
+
+This block exports the following pre-match features:
+\begin{itemize}
+    \item overall attack rating and overall defensive leakiness for both teams;
+    \item home-only and away-only venue splits;
+    \item implied home and away log corner rates;
+    \item overall strength difference;
+    \item venue-adjusted strength difference.
+\end{itemize}
+The block answers: how strong is each team at winning corners, how weak is it at preventing them, and how much of that signal changes between home and away.
+These Elo-style outputs are not used as stand-alone predictions. They are fed into the mean model as part of the feature vector. In other words, the LightGBM model looks at variables such as \texttt{home\_attack\_rating}, \texttt{away\_defence\_leakiness}, \texttt{log\_lambda\_home}, and \texttt{strength\_diff}, then learns how those pre-match strength snapshots map into actual home and away corner counts.
+
+\bigskip
+
+\noindent \textbf{What features go into the corner prediction model? How are they constructed?}
+
+\noindent The final production version uses 28 mean features. They fall into four groups.
+
+\textbf{Group 1: match context.}
+\begin{itemize}
+    \item \texttt{season\_id}
+    \item \texttt{gameweek}
+\end{itemize}
+These are cheap but useful controls. Season catches slow structural shifts in the data. Gameweek gives the model a simple place to learn season-phase effects.
+
+\textbf{Group 2: team-strength features from Stage 1a.}
+\begin{itemize}
+    \item \texttt{home\_attack\_rating}
+    \item \texttt{home\_defence\_leakiness}
+    \item \texttt{away\_attack\_rating}
+    \item \texttt{away\_defence\_leakiness}
+    \item \texttt{home\_attack\_at\_home}
+    \item \texttt{home\_defence\_at\_home}
+    \item \texttt{away\_attack\_at\_away}
+    \item \texttt{away\_defence\_at\_away}
+    \item \texttt{log\_lambda\_home}
+    \item \texttt{log\_lambda\_away}
+    \item \texttt{strength\_diff}
+    \item \texttt{venue\_strength\_diff}
+    \item \texttt{league\_log\_baseline\_away}
+\end{itemize}
+These features summarise the current pre-match corner environment.
+
+\textbf{Group 3: recent corner form.}
+\begin{itemize}
+    \item exponentially weighted averages of corners won and corners conceded;
+    \item rolling-window standard deviations of corners won and conceded.
+\end{itemize}
+The idea is simple: recent corner flow tells us whether a team is currently producing pressure or absorbing pressure, and recent standard deviation tells us whether that pattern is stable or noisy.
+
+\textbf{Group 4: recent goal state.}
+\begin{itemize}
+    \item rolling-window goals scored;
+    \item rolling-window goals conceded;
+    \item rolling-window goal difference.
+\end{itemize}
+These do not predict corners directly, but they help because style and game state matter. Teams playing on the front foot tend to create different corner profiles from teams sitting deep or chasing games.
+
+All rolling features are built from a per-team match table. One original match becomes two rows:
+\begin{itemize}
+    \item one row from the home team's point of view;
+    \item one row from the away team's point of view.
+\end{itemize}
+For each team row, I record:
+\begin{itemize}
+    \item \texttt{corners\_for}: corners won by that team in that match;
+    \item \texttt{corners\_against}: corners conceded by that team;
+    \item \texttt{goals\_for}: goals scored by that team;
+    \item \texttt{goals\_against}: goals conceded by that team;
+    \item \texttt{goal\_difference}: goals scored minus goals conceded.
+\end{itemize}
+Then I compute rolling and exponentially weighted summaries using only earlier rows from the same team. That is what keeps this block leak-free.
+
+The 28-feature version keeps Q1 at least as good as the larger model, and it is much better when passed into Q2. That is why I kept 28 and did not drop further.
+
+Top signals are:
+\begin{itemize}
+    \item \texttt{season\_id}
+    \item \texttt{away\_corners\_against\_ewm\_half\_life\_5}
+    \item \texttt{home\_goal\_difference\_rolling\_window\_20}
+    \item \texttt{home\_corners\_for\_ewm\_half\_life\_5}
+    \item \texttt{away\_goal\_difference\_rolling\_window\_20}
+\end{itemize}
+
+\bigskip
+
+\noindent \textbf{Why use LightGBM for the mean model instead of Ridge, Random Forest, or XGBoost?}
+
+\noindent I did not want to claim that by intuition alone, so I ran the comparison in code. On the Q1 validation split:
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Model & Home MAE & Away MAE & Diff MAE \\
+\midrule
+LightGBM & 2.2777 & 1.9866 & 3.3489 \\
+RandomForest & 2.2866 & 1.9932 & 3.3570 \\
+Ridge & 2.2876 & 1.9633 & 3.3346 \\
+XGBoost & 2.3194 & 2.0051 & 3.4007 \\
+Mean baseline & 2.3906 & 2.0909 & 3.5652 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The baseline is the mean of the training set predictions. It gives:
+\begin{itemize}
+    \item home MAE \(= 2.3906\);
+    \item away MAE \(= 2.0909\);
+    \item corner-difference MAE \(= 3.5652\).
+\end{itemize}
+
+Here MAE is
+\[
+\text{MAE}=\frac{1}{n}\sum_{i=1}^{n}\left|y_i-\hat{y}_i\right|.
+\]
+So home MAE is the average absolute error in predicted home corners, and away MAE is the same quantity for away corners. The best possible value is \(0\). There is no universal finite upper bound in theory, because the target is a nonnegative count and a model can be arbitrarily wrong. In practice the scale is anchored by the observed corner range in this dataset, so a move of about \(0.1\) in MAE is meaningful.
+
+The current 28-feature LightGBM Q1 model gives:
+\begin{itemize}
+    \item home MAE \(= 2.2777\);
+    \item away MAE \(= 1.9866\);
+    \item corner-difference MAE \(= 3.3489\).
+\end{itemize}
+
+So the gain over baseline is:
+\begin{itemize}
+    \item home MAE improves by \(0.1129\);
+    \item away MAE improves by \(0.1043\);
+    \item corner-difference MAE improves by \(0.2163\).
+\end{itemize}
+
+That is not a huge jump, but it is real, stable, and achieved without leaking holdout information into the mean head. The bigger practical win is that Q1 is not only a slightly better point predictor than the constant mean baseline. It also exports a much richer distributional object that Q2 can actually bet on.
+
+\bigskip
+
+\noindent \textbf{The procedure of prediction:}
+
+\noindent The final prediction is assembled in layers.
+\begin{enumerate}
+    \item Fit one mean model for home corners and one mean model for away corners. This gives raw point forecasts \(\hat{\mu}_{home}\) and \(\hat{\mu}_{away}\).
+    \item Apply the late-window correction to remove recent level bias in the raw mean forecasts.
+    \item Apply the market-teacher adjustment. This is trained on partition A and applied out of sample on partition B, so the mean head does not directly read the same market it will later be evaluated against in Q2.
+    \item Fit one variance model for the home side and one for the away side. These use predicted mean, market certainty, and rolling volatility to estimate \(\hat{\sigma}^{2}_{home}\) and \(\hat{\sigma}^{2}_{away}\).
+    \item Build residual quantiles \(q10, q50, q90\) from historically similar matches. Those quantiles give Q2 a lower anchor, a median anchor, and an upper anchor.
+\end{enumerate}
+
+At that point the match-level point forecast is already done:
+\[
+\text{Q1 point forecast}=(\hat{\mu}_{home}, \hat{\mu}_{away}).
+\]
+The variance layer does not change those means. It wraps uncertainty around them.
+
+So the final exported Q1 prediction is not just:
+\[
+\hat{\mu}_{home},\;\hat{\mu}_{away}.
+\]
+It is:
+\[
+\hat{\mu}_{home},\;
+\hat{\mu}_{away},\;
+\hat{\sigma}^{2}_{home},\;
+\hat{\sigma}^{2}_{away},\;
+\hat{q}_{10},\;
+\hat{q}_{50},\;
+\hat{q}_{90}.
+\]
+That matters because Q2 needs a distribution, not just a point estimate. The mean tells Q2 where the centre is. The variance and quantile anchors tell Q2 how wide the distribution should be and how cautious it should be in the tails.
+
+In the current pipeline, Q2 turns those Q1 outputs into market probabilities in the following way:
+\begin{enumerate}
+    \item treat \(\hat{\mu}_{home}, \hat{\sigma}^{2}_{home}\) as the first two moments of the home-corner count;
+    \item treat \(\hat{\mu}_{away}, \hat{\sigma}^{2}_{away}\) as the first two moments of the away-corner count;
+    \item convert those moments into a negative-binomial parameterisation for the two team-level count distributions;
+    \item combine the two team distributions into total-corner and corner-difference distributions, with an extra shared-correlation correction estimated on partition A;
+    \item use the \(q10/q50/q90\) anchors as a guardrail when a quoted market line is far outside Q1's own empirical range.
+\end{enumerate}
+So the split of responsibilities is clean:
+\begin{itemize}
+    \item Q1 predicts the centre and spread of each team's corner count;
+    \item Q2 converts that into probabilities for over/under, handicap, and 1X2 betting markets.
+\end{itemize}
+This is why mean and variance are enough for the next step. Once Q1 gives a centre and a spread for the home side, and a centre and a spread for the away side, Q2 can build approximate count distributions for both teams. From those distributions it can compute the probability of total corners going over a line, the probability of home corners beating away corners, and the probability of home, draw, or away in the corner 1X2 market.
+
+\bigskip
+
+\noindent \textbf{Question 2. Using your model from Q1, (a) calculate EV as the expected value of a bet, and (b) how many selections are you betting? Why?}
+
+\noindent \textbf{Answer.} 
+ 
+I first turn the Q1 outputs into market probabilities.
+
+For the home and away teams, Q1 gives:
+\[
+\hat{\mu}_{home},\;\hat{\sigma}^{2}_{home},\;\hat{\mu}_{away},\;\hat{\sigma}^{2}_{away}.
+\]
+From these, the betting layer forms total-corner and corner-difference moments:
+\[
+\mu_{total}=\hat{\mu}_{home}+\hat{\mu}_{away},
+\]
+\[
+\sigma^{2}_{total}=\hat{\sigma}^{2}_{home}+\hat{\sigma}^{2}_{away}
++2\rho\sqrt{\hat{\sigma}^{2}_{home}\hat{\sigma}^{2}_{away}},
+\]
+\[
+\mu_{diff}=\hat{\mu}_{home}-\hat{\mu}_{away},
+\]
+\[
+\sigma^{2}_{diff}=\hat{\sigma}^{2}_{home}+\hat{\sigma}^{2}_{away}
+-2\rho\sqrt{\hat{\sigma}^{2}_{home}\hat{\sigma}^{2}_{away}},
+\]
+where \(\rho\) is a shared home-away corner correlation estimated on partition A.
+
+These moments are then converted into market probabilities in two different ways:
+\begin{itemize}
+    \item for OU, use the total-corner mean and variance to build a negative-binomial total distribution, then compute \(P(T>L)\);
+    \item for HC and 1X2, use the corner-difference mean and variance to approximate a distribution for \(D=C_{home}-C_{away}\), then compute the probability of home, draw, or away relative to the quoted line.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{../outputs/kelly_backtest/probability_construction.png}
+\caption{How the model turns Q1 moments into market probabilities: OU uses the total-corner distribution, while HC and 1X2 use the corner-difference distribution.}
+\end{figure}
+
+For a decimal-odds bet with model win probability \(p\) and quoted odds \(o\), the unit-stake expected value is:
+\[
+\text{EV}=p\cdot o-1.
+\]
+That is the quantity used for filtering.
+
+The raw model probabilities are then calibrated on partition A with per-side isotonic calibration, and the most aggressive positive-EV tails are shrunk back toward no-vig market probabilities when the model looks too confident. The final quantity used for selection is \texttt{ev\_tail}, not the uncalibrated EV.
+
+Under the current default settings, the selection rule is:
+\begin{itemize}
+    \item bet 1X2 only if \(\text{EV} > 0.03\);
+    \item bet HC only if \(\text{EV} > 0.023\);
+    \item bet OU only if \(\text{EV} > 0.03\).
+\end{itemize}
+
+On clean partition B, this produces:
+\begin{itemize}
+    \item \(1275\) selections in total;
+    \item \(691\) from 1X2;
+    \item \(447\) from HC;
+    \item \(137\) from OU.
+\end{itemize}
+
+I am not betting every positive-EV line. I am only betting selections that clear the market-specific thresholds after calibration and tail shrink. The reason is practical: the smallest positive-EV bets are exactly where the model tends to be most optimistic, so it is better to give up some volume and keep the average edge cleaner.
+
+\bigskip
+
+\noindent \textbf{Question 3. ``Define Stake as the amount that you bet, calculate PnL as the Profit and Loss and RoI as PnL/Stake for each selection. (i) Calculate the overall PnL and RoI. (ii) Plot the cumulative PnL and EV as a function of time in days. (iii) Plot the 2-week rolling PnL and EV average.''}
+
+\noindent \textbf{Answer.} For stake sizing, I use Kelly rather than flat staking. The reason is that Kelly links bet size to estimated edge and current bankroll. If the estimated probabilities are correct, Kelly maximises expected log wealth. It is still aggressive, so I evaluate three fractions of Kelly instead of relying only on full Kelly.
+
+For a bet with model win probability \(p\) and decimal odds \(o\), the full Kelly fraction is
+\[
+f^{*}=\frac{po-1}{o-1}.
+\]
+I test three stake policies:
+\begin{itemize}
+    \item \(100\%\) Kelly: \(f=f^{*}\);
+    \item \(50\%\) Kelly: \(f=0.5f^{*}\);
+    \item \(25\%\) Kelly: \(f=0.25f^{*}\).
+\end{itemize}
+
+The bankroll rules in this section are fixed as:
+\begin{itemize}
+    \item initial bankroll \(=100\) USD;
+    \item fee rate \(=3\%\);
+    \item minimum fee \(=0.1\) USD per bet;
+    \item maximum single-bet stake \(=5000\) USD;
+    \item bankroll cannot go below zero;
+    \item once bankroll hits zero, betting stops.
+\end{itemize}
+
+So for one candidate bet at time \(t\), the executable stake is
+\[
+s_t=\min(B_t\cdot f,\; 5000),
+\]
+where \(B_t\) is the current bankroll. The fee is
+\[
+\text{fee}_t=\max(0.03s_t,\;0.1).
+\]
+If several bets share the same kickoff time, the code rescales them so that the total cash outlay
+\[
+\sum_t (s_t+\text{fee}_t)
+\]
+does not exceed the bankroll available before that kickoff block.
+
+For one realised bet with decimal odds \(o_t\), stake \(s_t\), fee \(\text{fee}_t\), and outcome \(w_t\in\{0,1\}\),
+\[
+\text{PnL}_t=
+\begin{cases}
+s_t(o_t-1)-\text{fee}_t, & \text{if } w_t=1,\\
+-s_t-\text{fee}_t, & \text{if } w_t=0.
+\end{cases}
+\]
+Overall PnL and turnover RoI are:
+\[
+\text{Total PnL}=\sum_t \text{PnL}_t,
+\qquad
+\text{RoI}=\frac{\sum_t \text{PnL}_t}{\sum_t s_t}.
+\]
+
+Under these exact bankroll constraints on partition B, the results are:
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Strategy & Total PnL & Ending Bankroll & Turnover RoI & Max Drawdown \\
+\midrule
+100\% Kelly & \(+1{,}241{,}259.35\) & \(1{,}241{,}359.35\) & \(23.51\%\) & \(-88.58\%\) \\
+50\% Kelly & \(+1{,}154{,}460.52\) & \(1{,}154{,}560.52\) & \(24.82\%\) & \(-44.33\%\) \\
+25\% Kelly & \(+960{,}068.68\) & \(960{,}168.68\) & \(27.24\%\) & \(-22.21\%\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+None of the three Kelly paths went bust in this realised sample, but full Kelly has extremely severe drawdowns. The most balanced line here is \(25\%\) Kelly: lower terminal PnL than full Kelly, but the highest turnover RoI and by far the mildest drawdown.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{../outputs/kelly_backtest/cumulative_net_pnl.png}
+\caption{Cumulative net PnL for 100\%, 50\%, and 25\% Kelly under the bankroll, fee, and stake-cap constraints.}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{../outputs/kelly_backtest/bankroll_paths_log.png}
+\caption{Kelly bankroll paths on a log scale. This view is more readable because the three strategies end at very different bankroll levels.}
+\end{figure}
+
+\bigskip
+
+\noindent \textbf{Question 4. ``Do you think that your assumed EV is an accurate representation of your real edge? (Hint: Run a Monte Carlo simulation)''}
+
+\noindent \textbf{Answer.} Not exactly. Kelly changes the stake size, but it does not repair probability miscalibration by itself. The edge still has to come from the probability model.
+
+To test this, I run a Monte Carlo simulation on the selected bets. For each selected bet \(i\), I treat the calibrated tail probability \(p_i\) as the Bernoulli win probability, simulate the bet outcome many times, and sum the simulated PnL across the whole portfolio. Repeating that gives a distribution for total PnL under the model's own assumptions.
+
+If the model's EV were perfectly calibrated, the realised PnL would sit in a fairly ordinary part of that simulated distribution. If the realised PnL kept landing near the extreme lower tail, that would mean the model is overstating its edge.
+
+The probability model behind the Kelly sizing was checked earlier with Monte Carlo on the selected partition-B bets:
+\begin{itemize}
+    \item actual total PnL \(=+254.02\);
+    \item Monte Carlo median PnL \(=+272.21\);
+    \item Monte Carlo 5th to 95th percentile range \(=[+175.27,\; +377.45]\);
+    \item actual percentile \(=38\)th.
+\end{itemize}
+
+So the realised outcome is below the model median, which means the model is still a bit optimistic, but it is not collapsing into the far left tail. Earlier versions of the pipeline were much worse on this point. After isotonic calibration and tail shrink, the assumed EV is not perfect, but it is much closer to a believable edge than the raw probabilities were.
+
+That matters even more once Kelly is applied, because stake size is a direct function of estimated edge. This is the main reason I prefer showing \(25\%\) and \(50\%\) Kelly alongside full Kelly rather than trusting full Kelly blindly.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.82\textwidth]{../outputs/kelly_backtest/selection_edge_monte_carlo.png}
+\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets. This checks whether the model edge that feeds Kelly is believable.}
+\end{figure}
+
+\end{document}

@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import q2_pipeline as q2
+import market_betting_backtest as market_backtest
 
 
 matplotlib.use("Agg")
@@ -47,41 +47,41 @@ def load_selected_bets(
     evaluation_scope: str,
     market_thresholds: dict[str, float],
 ) -> pd.DataFrame:
-    """Rebuild the current Q2-selected bet set from Q1 predictions and market data."""
-    predicted_matches, market_prices, observed_results = q2.read_prediction_inputs(data_dir)
-    predicted_matches = q2.attach_quantile_aware_distribution_inputs(predicted_matches)
+    """Rebuild the currently selected bet set from Q1 predictions and market prices."""
+    predicted_matches, market_prices, observed_results = market_backtest.load_prediction_and_market_tables(data_dir)
+    predicted_matches = market_backtest.attach_q1_distribution_columns(predicted_matches)
     partition_a_predictions = predicted_matches[predicted_matches["partition"] == "A"].copy()
     partition_b_predictions = predicted_matches[predicted_matches["partition"] == "B"].copy()
 
-    shared_rho_info = q2.estimate_shared_correlation(partition_a_predictions)
-    partition_a_raw = q2.attach_observed_outcomes(
-        q2.build_candidate_side_rows(partition_a_predictions, market_prices, shared_rho_info["rho"], "A"),
+    shared_rho_info = market_backtest.estimate_home_away_corner_correlation(partition_a_predictions)
+    partition_a_raw = market_backtest.attach_observed_outcomes(
+        market_backtest.build_candidate_bet_rows(partition_a_predictions, market_prices, shared_rho_info["rho"], "A"),
         observed_results,
     )
-    partition_b_raw = q2.attach_observed_outcomes(
-        q2.build_candidate_side_rows(partition_b_predictions, market_prices, shared_rho_info["rho"], "B"),
+    partition_b_raw = market_backtest.attach_observed_outcomes(
+        market_backtest.build_candidate_bet_rows(partition_b_predictions, market_prices, shared_rho_info["rho"], "B"),
         observed_results,
     )
 
-    base_calibrators, _ = q2.fit_isotonic_side_calibrators(partition_a_raw)
-    partition_a_calibrated = q2.attach_no_vig_market_probabilities(
-        q2.apply_base_probability_calibration(partition_a_raw, base_calibrators)
+    base_calibrators, _ = market_backtest.fit_side_probability_calibrators(partition_a_raw)
+    partition_a_calibrated = market_backtest.attach_market_no_vig_probabilities(
+        market_backtest.apply_side_probability_calibration(partition_a_raw, base_calibrators)
     )
-    partition_b_calibrated = q2.attach_no_vig_market_probabilities(
-        q2.apply_base_probability_calibration(partition_b_raw, base_calibrators)
+    partition_b_calibrated = market_backtest.attach_market_no_vig_probabilities(
+        market_backtest.apply_side_probability_calibration(partition_b_raw, base_calibrators)
     )
 
     tail_lambda_map = {
-        market_name: q2.fit_tail_lambda(partition_a_calibrated, market_name, market_thresholds[market_name])
-        for market_name in q2.TAIL_SHRINK_MARKETS
+        market_name: market_backtest.fit_tail_lambda(partition_a_calibrated, market_name, market_thresholds[market_name])
+        for market_name in market_backtest.TAIL_SHRINK_MARKETS
     }
-    tail_scale, _ = q2.choose_tail_scale(partition_a_calibrated, tail_lambda_map, market_thresholds)
-    partition_a_final = q2.attach_market_thresholds(
-        q2.apply_tail_probability_shrink(partition_a_calibrated, tail_lambda_map, tail_scale),
+    tail_scale, _ = market_backtest.choose_tail_scale(partition_a_calibrated, tail_lambda_map, market_thresholds)
+    partition_a_final = market_backtest.attach_market_thresholds(
+        market_backtest.apply_tail_probability_shrink(partition_a_calibrated, tail_lambda_map, tail_scale),
         market_thresholds,
     )
-    partition_b_final = q2.attach_market_thresholds(
-        q2.apply_tail_probability_shrink(partition_b_calibrated, tail_lambda_map, tail_scale),
+    partition_b_final = market_backtest.attach_market_thresholds(
+        market_backtest.apply_tail_probability_shrink(partition_b_calibrated, tail_lambda_map, tail_scale),
         market_thresholds,
     )
 
@@ -90,7 +90,7 @@ def load_selected_bets(
     else:
         evaluation_pool = partition_b_final.copy()
 
-    selected_bets = q2.select_bets_with_market_thresholds(evaluation_pool, "ev_tail")
+    selected_bets = market_backtest.select_bets_with_market_thresholds(evaluation_pool, "ev_tail")
     selected_bets = selected_bets.sort_values("date_time").reset_index(drop=True)
 
     print_heading("Selected Bets")
@@ -308,10 +308,10 @@ def run_kelly_backtest(
     max_bet: float = DEFAULT_MAX_BET,
     make_plots: bool = True,
 ) -> KellyBacktestArtifacts:
-    """Run the Kelly-only bankroll backtest on the current Q2-selected bets."""
+    """Run the Kelly-only bankroll backtest on the current selected bets."""
     data_path = Path(data_dir)
     result_path = Path(output_dir)
-    market_thresholds = q2.DEFAULT_MARKET_THRESHOLDS.copy()
+    market_thresholds = market_backtest.DEFAULT_MARKET_THRESHOLDS.copy()
     selected_bets = load_selected_bets(data_path, evaluation_scope, market_thresholds)
 
     strategy_paths: dict[str, pd.DataFrame] = {}
@@ -346,7 +346,7 @@ def run_kelly_backtest(
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for the Kelly-only bankroll backtest."""
-    parser = argparse.ArgumentParser(description="Run a Kelly-only bankroll backtest on the current Q2 selections.")
+    parser = argparse.ArgumentParser(description="Run a Kelly-only bankroll backtest on the current market-backtest selections.")
     parser.add_argument("--data-dir", default=".", help="Directory containing the current Q1 outputs and market files.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory where Kelly outputs will be written.")
     parser.add_argument("--evaluation-scope", choices=["B", "ALL"], default=DEFAULT_EVALUATION_SCOPE, help="Use clean B only or the full A+B betting window.")

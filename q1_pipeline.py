@@ -1,3 +1,17 @@
+"""Q1 pipeline: leak-free feature building, mean prediction, and variance calibration.
+
+The pipeline has three jobs:
+
+1. turn cleaned match history into team and form features;
+2. predict home and away corner means for every target match;
+3. calibrate conditional variance and market-aware adjustments.
+   Raw market odds are not used as target values or copied directly into the prediction. 
+   Market information is transformed into higher-level signals, 
+   like implied total level, side strength, certainty, and model–market disagreement, 
+   and used only to adjust the predicted distribution width and calibration.
+
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -23,16 +37,28 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 
 
+# Per-team rolling form features built in the one-row-per-team-per-match table.
+# Naming convention:
+# - corners_for: the team's own corner count in that match
+# - corners_against: the opponent's corner count against that team
+# - goals_for / goals_against: the team's own goals scored / conceded
+# - goal_difference: goals_for minus goals_against
+# - ewm_half_life_5: exponentially weighted moving average with half-life 5 matches
+# - rolling_window_20: rolling summary over the last 20 matches
 TEAM_FEATURE_COLS = [
-    "cf_ewm_hl5",
-    "ca_ewm_hl5",
-    "gf_l20",
-    "ga_l20",
-    "gd_l20",
-    "cf_std_l20",
-    "ca_std_l20",
+    "corners_for_ewm_half_life_5",
+    "corners_against_ewm_half_life_5",
+    "goals_for_rolling_window_20",
+    "goals_against_rolling_window_20",
+    "goal_difference_rolling_window_20",
+    "corners_for_std_rolling_window_20",
+    "corners_against_std_rolling_window_20",
 ]
 
+# sub-model: team strength features built to predict the corner counts
+# As team strength is the main signal for corner counts （verified by feature importance）
+# These summarize each team's attack and defence level, both overall and in
+# home/away-specific contexts, plus the implied corner-rate balance.
 STAGE1A_COLS = [
     "home_attack_rating",
     "home_defence_leakiness",
@@ -48,8 +74,9 @@ STAGE1A_COLS = [
     "venue_strength_diff",
 ]
 
+# LightGBM model using the output of the team strength model plus some raw features. 
+# 28-feature subset survived the feature-ablation check. 
 FEATURE_COLS = [
-    "competition_id",
     "season_id",
     "gameweek",
     "home_attack_rating",
@@ -64,33 +91,44 @@ FEATURE_COLS = [
     "log_lambda_away",
     "strength_diff",
     "venue_strength_diff",
-    "league_log_baseline_home",
     "league_log_baseline_away",
-    "prior_match_count_home",
-    "prior_match_count_away",
-    "home_cf_ewm_hl5",
-    "home_ca_ewm_hl5",
-    "away_cf_ewm_hl5",
-    "away_ca_ewm_hl5",
-    "home_gf_l20",
-    "home_ga_l20",
-    "home_gd_l20",
-    "away_gf_l20",
-    "away_ga_l20",
-    "away_gd_l20",
-    "home_cf_std_l20",
-    "home_ca_std_l20",
-    "away_cf_std_l20",
-    "away_ca_std_l20",
+    "home_corners_for_ewm_half_life_5",
+    "home_corners_against_ewm_half_life_5",
+    "away_corners_for_ewm_half_life_5",
+    "away_corners_against_ewm_half_life_5",
+    "home_goals_against_rolling_window_20",
+    "home_goal_difference_rolling_window_20",
+    "away_goals_for_rolling_window_20",
+    "away_goals_against_rolling_window_20",
+    "away_goal_difference_rolling_window_20",
+    "home_corners_for_std_rolling_window_20",
+    "home_corners_against_std_rolling_window_20",
+    "away_corners_for_std_rolling_window_20",
+    "away_corners_against_std_rolling_window_20",
 ]
 
-CATEGORICAL_COLS = ["competition_id", "season_id"]
+
+CATEGORICAL_COLS = ["season_id"]
+
+# Fallback probability when only one side of a two-way market is present.
 MARKET_TWO_WAY_FILL = 1 / 3
+
+# Lower and upper bounds for total-corner means.
 MARKET_TARGET_MIN_TOTAL = 0.1
 MARKET_TARGET_MAX_TOTAL = 30.0
+
+# Quantile predictions thresholds for corners
 RESIDUAL_QUANTILES = (0.10, 0.50, 0.90)
+
+# Residual-quantile bucket number, which controls the granularity of the variance. 
+# More buckets can capture finer patterns but risk overfitting and sparsity.
 RESIDUAL_QUANTILE_BUCKETS = 4
+
+# Minimum sample size before a residual bucket is trusted.
 RESIDUAL_QUANTILE_MIN_GROUP = 12
+
+# Width of a standard-normal 10th-to-90th percentile interval.
+# This turns a q10/q90 spread into an approximate variance estimate.
 NORMAL_Q10_Q90_SPAN = 2.5631031310892007
 
 
@@ -131,9 +169,9 @@ def write_csv_with_fallback(frame: pd.DataFrame, path: Path) -> Path:
         return fallback
 
 
-def irreducible_mae(lam: float, n: int = 200_000) -> float:
+def irreducible_mae(poisson_mean: float, n: int = 200_000) -> float:
     """Approximate the Poisson irreducible MAE floor by Monte Carlo sampling."""
-    return float(np.mean(np.abs(np.random.poisson(lam, n) - lam)))
+    return float(np.mean(np.abs(np.random.poisson(poisson_mean, n) - poisson_mean)))
 
 
 def latest_snapshot(
@@ -151,20 +189,24 @@ def latest_snapshot(
     return out[["match_id"] + cols].rename(columns=renamed)
 
 
-def poisson_nll(y: pd.Series | np.ndarray, mu: np.ndarray) -> float:
+def poisson_nll(observed_corners: pd.Series | np.ndarray, predicted_mean: np.ndarray) -> float:
     """Compute average Poisson negative log-likelihood."""
-    mu = np.clip(mu, 1e-6, None)
-    return float(-poisson.logpmf(np.asarray(y, int), mu).mean())
+    safe_predicted_mean = np.clip(predicted_mean, 1e-6, None)
+    return float(-poisson.logpmf(np.asarray(observed_corners, int), safe_predicted_mean).mean())
 
 
-def poisson_crps(y: pd.Series | np.ndarray, mu: np.ndarray, k_max: int = 40) -> float:
+def poisson_crps(
+    observed_corners: pd.Series | np.ndarray,
+    predicted_mean: np.ndarray,
+    k_max: int = 40,
+) -> float:
     """Approximate Poisson CRPS by summing squared CDF errors on a finite grid."""
-    y_arr = np.asarray(y, int)
-    mu_arr = np.asarray(mu, float)
-    ks = np.arange(k_max).reshape(-1, 1)
-    cdf = poisson.cdf(ks, mu_arr.reshape(1, -1))
-    indicator = (ks >= y_arr.reshape(1, -1)).astype(float)
-    return float(np.mean(np.sum((cdf - indicator) ** 2, axis=0)))
+    observed_array = np.asarray(observed_corners, int)
+    predicted_mean_array = np.asarray(predicted_mean, float)
+    corner_grid = np.arange(k_max).reshape(-1, 1)
+    poisson_cdf = poisson.cdf(corner_grid, predicted_mean_array.reshape(1, -1))
+    realised_tail_indicator = (corner_grid >= observed_array.reshape(1, -1)).astype(float)
+    return float(np.mean(np.sum((poisson_cdf - realised_tail_indicator) ** 2, axis=0)))
 
 
 def devig_two_way(price_over: float, price_under: float) -> tuple[float, float] | None:
@@ -200,15 +242,45 @@ def devig_three_way(price_home: float, price_away: float, price_draw: float) -> 
 
 
 def solve_total_mean_from_ou(line: float, prob_over: float) -> float | None:
-    """Invert a half-line OU market into an implied total-corners mean."""
+    """Infer a market-implied total-corners mean from a half-line OU market.
+
+    Assumption:
+        Total corners follows a Poisson distribution ~ Poisson(lambda_total)
+
+    For a half-line such as 9.5, "over" means: Total > 9.5
+
+    Since total corners are integer counts, this is equivalent to:
+            Total >= 10
+            Total > floor(9.5)
+
+    Therefore, for a given market no-vig over probability p_over, we solve:
+            P(Poisson(lambda_total) > floor(line)) = p_over
+
+    The solution lambda_total is interpreted as the market-implied expected
+    total number of corners.
+
+    Only half-lines are inverted here because they have no push outcome.
+    Integer lines would require explicit push handling.
+    """
     if pd.isna(line) or pd.isna(prob_over):
         return None
+    
+    # Only invert clean half-lines such as 8.5, 9.5, 10.5.
+    # These avoid push outcomes.
     fractional = round(float(line) % 1, 3)
     if fractional != 0.5:
         return None
+
+    # Example:
+    #   line = 9.5
+    #   threshold = 9
+    #   P(over 9.5) = P(total corners > 9)
+
     threshold = int(np.floor(line))
 
     def objective(total_mean: float) -> float:
+        # Difference between Poisson-implied over probability and
+        # market-implied over probability.
         return float(1 - poisson.cdf(threshold, total_mean) - prob_over)
 
     try:
@@ -217,10 +289,43 @@ def solve_total_mean_from_ou(line: float, prob_over: float) -> float | None:
         return None
 
 
-def skellam_probabilities(mu_home: float, mu_away: float) -> tuple[float, float, float]:
-    """Return home-win, away-win, and draw probabilities for a Skellam model."""
-    prob_draw = float(skellam.pmf(0, mu_home, mu_away))
-    prob_away = float(skellam.cdf(-1, mu_home, mu_away))
+def skellam_probabilities(
+    predicted_home_mean: float,
+    predicted_away_mean: float,
+) -> tuple[float, float, float]:
+    
+    """Convert home/away expected corners into 1X2 corner probabilities.
+
+    Assumption:
+        Home corners and away corners are independent Poisson variables:
+
+            Home ~ Poisson(mu_home)
+            Away ~ Poisson(mu_away)
+
+        Then their difference:
+
+            D = Home - Away
+
+        follows a Skellam distribution:
+
+            D ~ Skellam(mu_home, mu_away)
+
+    The 1X2 corner market can then be computed as:
+
+        home wins corners: D > 0
+        draw in corners:  D = 0
+        away wins corners: D < 0
+
+    Returns:
+        (prob_home, prob_away, prob_draw)
+
+    Note:
+        The return order is home, away, draw. Be careful not to treat it
+        as home, draw, away.
+    """
+
+    prob_draw = float(skellam.pmf(0, predicted_home_mean, predicted_away_mean))
+    prob_away = float(skellam.cdf(-1, predicted_home_mean, predicted_away_mean))
     prob_home = float(1 - prob_draw - prob_away)
     return prob_home, prob_away, prob_draw
 
@@ -235,11 +340,11 @@ def solve_home_away_means_from_market(
     if total_mean <= 0:
         return None
 
-    def loss(mu_home: float) -> float:
-        mu_away = total_mean - mu_home
-        if mu_home <= 0 or mu_away <= 0:
+    def loss(candidate_home_mean: float) -> float:
+        candidate_away_mean = total_mean - candidate_home_mean
+        if candidate_home_mean <= 0 or candidate_away_mean <= 0:
             return 1e9
-        model_home, model_away, model_draw = skellam_probabilities(mu_home, mu_away)
+        model_home, model_away, model_draw = skellam_probabilities(candidate_home_mean, candidate_away_mean)
         return float(
             (model_home - prob_home) ** 2
             + (model_away - prob_away) ** 2
@@ -252,11 +357,11 @@ def solve_home_away_means_from_market(
         return None
     if not fit.success:
         return None
-    mu_home = float(fit.x)
-    mu_away = float(total_mean - mu_home)
-    if mu_home <= 0 or mu_away <= 0:
+    predicted_home_mean = float(fit.x)
+    predicted_away_mean = float(total_mean - predicted_home_mean)
+    if predicted_home_mean <= 0 or predicted_away_mean <= 0:
         return None
-    return mu_home, mu_away
+    return predicted_home_mean, predicted_away_mean
 
 
 def infer_market_means_for_row(row: pd.Series) -> tuple[float, float] | None:
@@ -274,7 +379,8 @@ def infer_market_means_for_row(row: pd.Series) -> tuple[float, float] | None:
 
 
 def compute_market_feature_row(row: pd.Series) -> pd.Series:
-    """Turn raw 1X2/OU/HC prices into one row of abstract market features."""
+    """Turn raw 1X2/OU/HC prices into one row of abstract market features.
+    Use devigged probabilities to compute market-implied team strength features"""
     probs_1x2 = devig_three_way(row.get("p1x2_home_price"), row.get("p1x2_away_price"), row.get("p1x2_draw_price"))
     probs_ou = devig_two_way(row.get("ou_over_price"), row.get("ou_under_price"))
     probs_hc = devig_two_way(row.get("hc_home_price"), row.get("hc_away_price"))
@@ -287,9 +393,9 @@ def compute_market_feature_row(row: pd.Series) -> pd.Series:
         market_total_mean = float(market_home_mean + market_away_mean)
         market_diff_mean = float(market_home_mean - market_away_mean)
 
-    p_1x2_home = probs_1x2[0] if probs_1x2 is not None else 1 / 3
-    p_1x2_away = probs_1x2[1] if probs_1x2 is not None else 1 / 3
-    p_1x2_draw = probs_1x2[2] if probs_1x2 is not None else 1 / 3
+    p_1x2_home = probs_1x2[0] if probs_1x2 is not None else MARKET_TWO_WAY_FILL
+    p_1x2_away = probs_1x2[1] if probs_1x2 is not None else MARKET_TWO_WAY_FILL
+    p_1x2_draw = probs_1x2[2] if probs_1x2 is not None else MARKET_TWO_WAY_FILL
     p_ou_over = probs_ou[0] if probs_ou is not None else 0.5
     p_ou_under = probs_ou[1] if probs_ou is not None else 0.5
     p_hc_home = probs_hc[0] if probs_hc is not None else 0.5
@@ -530,8 +636,8 @@ def attach_market_quantile_features(
     enriched["predicted_away_mean"] = predicted_away_bet
     enriched["predicted_total_mean"] = predicted_home_bet + predicted_away_bet
     enriched["predicted_diff_mean"] = predicted_home_bet - predicted_away_bet
-    enriched["home_cf_std_l20"] = enriched["home_cf_std_l20"].fillna(global_std_c)
-    enriched["away_cf_std_l20"] = enriched["away_cf_std_l20"].fillna(global_std_c)
+    enriched["home_corners_for_std_rolling_window_20"] = enriched["home_corners_for_std_rolling_window_20"].fillna(global_std_c)
+    enriched["away_corners_for_std_rolling_window_20"] = enriched["away_corners_for_std_rolling_window_20"].fillna(global_std_c)
 
     if "market_target_home" not in enriched.columns or "market_target_away" not in enriched.columns:
         inferred = enriched.apply(infer_market_means_for_row, axis=1)
@@ -553,7 +659,7 @@ def attach_market_quantile_features(
             "side_name": "home",
             "prediction_col": "predicted_home_mean",
             "actual_col": "home_corners",
-            "rolling_std_col": "home_cf_std_l20",
+            "rolling_std_col": "home_corners_for_std_rolling_window_20",
             "gap_col": "market_vs_model_home_gap",
             "output_cols": ("pred_home_q10", "pred_home_q50", "pred_home_q90", "quantile_sigma2_home", "quantile_lookup_level_home"),
         },
@@ -561,7 +667,7 @@ def attach_market_quantile_features(
             "side_name": "away",
             "prediction_col": "predicted_away_mean",
             "actual_col": "away_corners",
-            "rolling_std_col": "away_cf_std_l20",
+            "rolling_std_col": "away_corners_for_std_rolling_window_20",
             "gap_col": "market_vs_model_away_gap",
             "output_cols": ("pred_away_q10", "pred_away_q50", "pred_away_q90", "quantile_sigma2_away", "quantile_lookup_level_away"),
         },
@@ -788,7 +894,7 @@ def build_strength_features(
 
 
 def build_team_games(model_data: pd.DataFrame) -> pd.DataFrame:
-    """Convert match rows into one row per team appearance."""
+    """Convert match rows into a one-row-per-team-per-match table."""
     home_rows = model_data[
         [
             "match_id",
@@ -836,7 +942,7 @@ def build_team_games(model_data: pd.DataFrame) -> pd.DataFrame:
     team_games = pd.concat([home_rows, away_rows], ignore_index=True)
     team_games = team_games.sort_values(["team_id", "date_time", "match_id"]).reset_index(drop=True)
 
-    print_heading("Team-Game Long Format")
+    print_heading("Per-Team Match Table")
     print(
         f"match-level rows: {len(model_data):,} -> team-game rows: {len(team_games):,} (= 2 x match rows)"
     )
@@ -845,31 +951,40 @@ def build_team_games(model_data: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_rolling_features(team_games: pd.DataFrame) -> pd.DataFrame:
-    """Add rolling attacking, defensive, and goal-based team features."""
+    """Add rolling corner and goal summaries to the per-team match table."""
     team_games = team_games.copy()
-    team_games["cf_ewm_hl5"] = team_games.groupby("team_id")["corners_for"].transform(
+    team_games["corners_for_ewm_half_life_5"] = team_games.groupby("team_id")["corners_for"].transform(
         lambda series: series.shift(1).ewm(halflife=5, ignore_na=True).mean()
     )
-    team_games["ca_ewm_hl5"] = team_games.groupby("team_id")["corners_against"].transform(
+    team_games["corners_against_ewm_half_life_5"] = team_games.groupby("team_id")["corners_against"].transform(
         lambda series: series.shift(1).ewm(halflife=5, ignore_na=True).mean()
     )
-    team_games["gf_l20"] = team_games.groupby("team_id")["goals_for"].transform(
+    team_games["goals_for_rolling_window_20"] = team_games.groupby("team_id")["goals_for"].transform(
         lambda series: series.shift(1).rolling(20, min_periods=3).mean()
     )
-    team_games["ga_l20"] = team_games.groupby("team_id")["goals_against"].transform(
+    team_games["goals_against_rolling_window_20"] = team_games.groupby("team_id")["goals_against"].transform(
         lambda series: series.shift(1).rolling(20, min_periods=3).mean()
     )
-    team_games["gd_l20"] = team_games["gf_l20"] - team_games["ga_l20"]
-    team_games["cf_std_l20"] = team_games.groupby("team_id")["corners_for"].transform(
+    team_games["goal_difference_rolling_window_20"] = (
+        team_games["goals_for_rolling_window_20"] - team_games["goals_against_rolling_window_20"]
+    )
+    team_games["corners_for_std_rolling_window_20"] = team_games.groupby("team_id")["corners_for"].transform(
         lambda series: series.shift(1).rolling(20, min_periods=5).std()
     )
-    team_games["ca_std_l20"] = team_games.groupby("team_id")["corners_against"].transform(
+    team_games["corners_against_std_rolling_window_20"] = team_games.groupby("team_id")["corners_against"].transform(
         lambda series: series.shift(1).rolling(20, min_periods=5).std()
     )
     team_games["n_prior"] = team_games.groupby("team_id").cumcount()
 
     nan_summary = team_games[
-        ["cf_ewm_hl5", "ca_ewm_hl5", "gf_l20", "ga_l20", "cf_std_l20", "ca_std_l20"]
+        [
+            "corners_for_ewm_half_life_5",
+            "corners_against_ewm_half_life_5",
+            "goals_for_rolling_window_20",
+            "goals_against_rolling_window_20",
+            "corners_for_std_rolling_window_20",
+            "corners_against_std_rolling_window_20",
+        ]
     ].isna().sum()
     print_heading("Stage 1b")
     print(f"team_games with rolling features: {team_games.shape}")
@@ -949,7 +1064,7 @@ def build_match_features(
     )
 
     for col in ["p_h_1x2", "p_a_1x2", "p_d_1x2"]:
-        betting_match_features[col] = betting_match_features[col].fillna(1 / 3)
+        betting_match_features[col] = betting_match_features[col].fillna(MARKET_TWO_WAY_FILL)
 
     print_heading("Match-Level Features")
     print(f"features: {features.shape}")
@@ -1024,18 +1139,32 @@ def fill_missing_features(
     log_mean_a = float(np.log(global_mean_a))
 
     for frame in [features, betting_match_features]:
-        frame["home_cf_ewm_hl5"] = frame["home_cf_ewm_hl5"].fillna(global_mean_h)
-        frame["home_ca_ewm_hl5"] = frame["home_ca_ewm_hl5"].fillna(global_mean_a)
-        frame["away_cf_ewm_hl5"] = frame["away_cf_ewm_hl5"].fillna(global_mean_a)
-        frame["away_ca_ewm_hl5"] = frame["away_ca_ewm_hl5"].fillna(global_mean_h)
+        frame["home_corners_for_ewm_half_life_5"] = frame["home_corners_for_ewm_half_life_5"].fillna(global_mean_h)
+        frame["home_corners_against_ewm_half_life_5"] = frame["home_corners_against_ewm_half_life_5"].fillna(global_mean_a)
+        frame["away_corners_for_ewm_half_life_5"] = frame["away_corners_for_ewm_half_life_5"].fillna(global_mean_a)
+        frame["away_corners_against_ewm_half_life_5"] = frame["away_corners_against_ewm_half_life_5"].fillna(global_mean_h)
 
-        for col in ["home_gf_l20", "home_ga_l20", "away_gf_l20", "away_ga_l20"]:
+        for col in [
+            "home_goals_for_rolling_window_20",
+            "home_goals_against_rolling_window_20",
+            "away_goals_for_rolling_window_20",
+            "away_goals_against_rolling_window_20",
+        ]:
             frame[col] = frame[col].fillna(global_mean_g)
 
-        frame["home_gd_l20"] = frame["home_gf_l20"] - frame["home_ga_l20"]
-        frame["away_gd_l20"] = frame["away_gf_l20"] - frame["away_ga_l20"]
+        frame["home_goal_difference_rolling_window_20"] = (
+            frame["home_goals_for_rolling_window_20"] - frame["home_goals_against_rolling_window_20"]
+        )
+        frame["away_goal_difference_rolling_window_20"] = (
+            frame["away_goals_for_rolling_window_20"] - frame["away_goals_against_rolling_window_20"]
+        )
 
-        for col in ["home_cf_std_l20", "home_ca_std_l20", "away_cf_std_l20", "away_ca_std_l20"]:
+        for col in [
+            "home_corners_for_std_rolling_window_20",
+            "home_corners_against_std_rolling_window_20",
+            "away_corners_for_std_rolling_window_20",
+            "away_corners_against_std_rolling_window_20",
+        ]:
             frame[col] = frame[col].fillna(global_std_c)
 
         frame["league_log_baseline_home"] = frame["league_log_baseline_home"].fillna(log_mean_h)
@@ -1233,10 +1362,10 @@ def stage3_calibration(
     actual_away_partition_a = betting_match_features.loc[a_mask, "away_corners"].astype(float).values
     predicted_home_partition_a = predicted_home_bet[a_mask]
     predicted_away_partition_a = predicted_away_bet[a_mask]
-    market_home_prob_a = betting_match_features.loc[a_mask, "p_h_1x2"].fillna(1 / 3).values
-    market_away_prob_a = betting_match_features.loc[a_mask, "p_a_1x2"].fillna(1 / 3).values
-    rolling_home_std_a = betting_match_features.loc[a_mask, "home_cf_std_l20"].fillna(global_std_c).values
-    rolling_away_std_a = betting_match_features.loc[a_mask, "away_cf_std_l20"].fillna(global_std_c).values
+    market_home_prob_a = betting_match_features.loc[a_mask, "p_h_1x2"].fillna(MARKET_TWO_WAY_FILL).values
+    market_away_prob_a = betting_match_features.loc[a_mask, "p_a_1x2"].fillna(MARKET_TWO_WAY_FILL).values
+    rolling_home_std_a = betting_match_features.loc[a_mask, "home_corners_for_std_rolling_window_20"].fillna(global_std_c).values
+    rolling_away_std_a = betting_match_features.loc[a_mask, "away_corners_for_std_rolling_window_20"].fillna(global_std_c).values
     market_certainty_home_a = np.abs(market_home_prob_a - 0.5)
     market_certainty_away_a = np.abs(market_away_prob_a - 0.5)
 
@@ -1300,10 +1429,10 @@ def stage3_calibration(
     print(f"B MAE home: raw={mae_h_raw:.4f} calib={mae_h_cal:.4f} delta={mae_h_cal - mae_h_raw:+.4f}")
     print(f"B MAE away: raw={mae_a_raw:.4f} calib={mae_a_cal:.4f} delta={mae_a_cal - mae_a_raw:+.4f}")
 
-    market_home_prob_all = betting_match_features["p_h_1x2"].fillna(1 / 3).values
-    market_away_prob_all = betting_match_features["p_a_1x2"].fillna(1 / 3).values
-    rolling_home_std_all = betting_match_features["home_cf_std_l20"].fillna(global_std_c).values
-    rolling_away_std_all = betting_match_features["away_cf_std_l20"].fillna(global_std_c).values
+    market_home_prob_all = betting_match_features["p_h_1x2"].fillna(MARKET_TWO_WAY_FILL).values
+    market_away_prob_all = betting_match_features["p_a_1x2"].fillna(MARKET_TWO_WAY_FILL).values
+    rolling_home_std_all = betting_match_features["home_corners_for_std_rolling_window_20"].fillna(global_std_c).values
+    rolling_away_std_all = betting_match_features["away_corners_for_std_rolling_window_20"].fillna(global_std_c).values
     predicted_home_variance = dispersion_home.predict(adjusted_home_bet, np.abs(market_home_prob_all - 0.5), rolling_home_std_all)
     predicted_away_variance = dispersion_away.predict(adjusted_away_bet, np.abs(market_away_prob_all - 0.5), rolling_away_std_all)
 
@@ -1463,8 +1592,24 @@ def make_distribution_plot(
     inflation_factors: dict[str, float] = {}
 
     for ax, y_series, mu, std_col, disp_model, name, key in [
-        (axes[0], y_val_h, predicted_home_val, "home_cf_std_l20", dispersion_home, "Home", "h"),
-        (axes[1], y_val_a, predicted_away_val, "away_cf_std_l20", dispersion_away, "Away", "a"),
+        (
+            axes[0],
+            y_val_h,
+            predicted_home_val,
+            "home_corners_for_std_rolling_window_20",
+            dispersion_home,
+            "Home",
+            "h",
+        ),
+        (
+            axes[1],
+            y_val_a,
+            predicted_away_val,
+            "away_corners_for_std_rolling_window_20",
+            dispersion_away,
+            "Away",
+            "a",
+        ),
     ]:
         y = np.asarray(y_series, float)
         y_int = y.astype(int)

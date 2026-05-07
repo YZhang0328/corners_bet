@@ -1,16 +1,16 @@
 """Heteroscedastic dispersion model: predict per-match conditional variance.
 
-Stage 2 of the corner pipeline produces a point prediction `mu` for each
-side (home or away). The realised count `y` scatters around `mu` with a
+Stage 2 of the corner pipeline produces a point prediction for each side
+(home or away). The realised count scatters around that prediction with a
 variance that depends on:
 
-    - the level of `mu`  (bigger means usually mean bigger variance)
+    - the level of the predicted mean
     - market certainty   (heavy 1X2 favourites scatter less)
     - the team's own historical variance behaviour
 
 We model:
 
-    log(sigma^2) = beta_0 + beta_1 * mu
+    log(sigma^2) = beta_0 + beta_1 * predicted_mean
                           + beta_2 * market_certainty
                           + beta_3 * rolling_std
 
@@ -29,7 +29,7 @@ correct with a single multiplicative scale chosen so the predicted
 variance averages match the realised squared residuals on the
 calibration set:
 
-    calibration_scale = mean( (y - mu)^2 ) / mean( exp(beta . x) )
+    calibration_scale = mean(squared_residual) / mean(exp(beta . x))
 
 After this scalar correction, predicted-variance mean equals
 realised-residual-square mean on the calibration set by construction.
@@ -67,41 +67,45 @@ class DispersionModel:
     coefficients: np.ndarray
     calibration_scale: float
 
-    def predict(self,
-                mu: np.ndarray,
-                market_certainty: np.ndarray,
-                rolling_std: np.ndarray) -> np.ndarray:
+    def predict(
+        self,
+        predicted_mean: np.ndarray,
+        market_certainty: np.ndarray,
+        rolling_std: np.ndarray,
+    ) -> np.ndarray:
         """Predict sigma^2 for each match.
 
         Inputs are 1D arrays of equal length:
-            mu                -- Stage 2 point prediction for the side
+            predicted_mean    -- Stage 2 point prediction for the side
             market_certainty  -- abs(p_1x2 - 0.5), zero at coin-flip
             rolling_std       -- team's rolling-window corner std
 
         Returns sigma^2 (1D array, same length).
         """
-        design = np.column_stack([mu, market_certainty, rolling_std])
+        design = np.column_stack([predicted_mean, market_certainty, rolling_std])
         log_variance_raw = self.intercept + design @ self.coefficients
         return self.calibration_scale * np.exp(log_variance_raw)
 
 
-def fit_dispersion(mu: np.ndarray,
-                   observed: np.ndarray,
-                   market_certainty: np.ndarray,
-                   rolling_std: np.ndarray,
-                   variance_log_offset: float = VARIANCE_LOG_OFFSET) -> DispersionModel:
+def fit_dispersion(
+    predicted_mean: np.ndarray,
+    observed_corners: np.ndarray,
+    market_certainty: np.ndarray,
+    rolling_std: np.ndarray,
+    variance_log_offset: float = VARIANCE_LOG_OFFSET,
+) -> DispersionModel:
     """Fit log-OLS dispersion model and apply the Jensen bias correction.
 
     Inputs (all 1D arrays of equal length, all on the calibration set):
-        mu                -- Stage 2 point predictions
-        observed          -- realised corner counts
+        predicted_mean    -- Stage 2 point predictions
+        observed_corners  -- realised corner counts
         market_certainty  -- abs(p_1x2 - 0.5)
         rolling_std       -- team rolling-window corner std
 
     Returns a DispersionModel ready for `.predict(...)` on any data.
     """
-    design = np.column_stack([mu, market_certainty, rolling_std])
-    squared_residuals = (observed - mu) ** 2
+    design = np.column_stack([predicted_mean, market_certainty, rolling_std])
+    squared_residuals = (observed_corners - predicted_mean) ** 2
     target = np.log(squared_residuals + variance_log_offset)
 
     fit = LinearRegression().fit(design, target)
