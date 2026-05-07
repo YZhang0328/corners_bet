@@ -30,11 +30,11 @@
 
 \par\vspace{0.25cm}
 
-Once that distribution is good enough, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better risk-adjusted profile, and in this setting that matters more than maximising cash. Just as importantly, Kelly is highly sensitive to probability error, so stress testing is not optional.
+Once that distribution is good enough, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better risk-adjusted profile, which matters more here than maximising terminal cash. Just as importantly, Kelly is highly sensitive to probability error, so stress testing is not optional.
 
 \par\vspace{0.25cm}
 
-Questions 2 and 3 are standard at the formula level: EV, distributions, and Kelly are well known. The real issue is whether the model probabilities behind those formulas are believable. That is why the assumptions have to be checked, especially with Monte Carlo. 
+Questions 2 and 3 are standard at the formula level: EV, distributions, and Kelly are well known. The real issue is whether the model probabilities behind those formulas are believable. That is why the assumptions have to be checked, especially with Monte Carlo. If the EV is not credible, Kelly is not credible either.
 
 }
 
@@ -372,12 +372,14 @@ Under the current default settings, the selection rule is:
     \item bet OU only if \(\text{EV} > 0.03\).
 \end{itemize}
 
+These thresholds were not chosen arbitrarily. After calibration and tail shrink, 1X2 remained the weakest and noisiest market, so it needed the strictest filter. In the realised partition-B sweep, keeping HC and OU fixed at \(0.023\) and \(0.03\), moving the 1X2 threshold from \(0.00\) to \(0.03\) improved unit-stake RoI from \(18.6\%\) to \(35.2\%\), and at \(0.035\) the 1X2 book was filtered out completely, leaving only HC and OU. HC was much less sensitive in the \(0.02\) to \(0.03\) range, so \(0.023\) was kept as a middle ground. OU improved steadily from \(0.02\) to \(0.03\), so \(0.03\) was retained as the cleaner setting.
+
 On clean partition B, this produces:
 \begin{itemize}
-    \item \(1275\) selections in total;
-    \item \(691\) from 1X2;
-    \item \(447\) from HC;
-    \item \(137\) from OU.
+    \item \(866\) selections in total;
+    \item \(261\) from 1X2;
+    \item \(456\) from HC;
+    \item \(149\) from OU.
 \end{itemize}
 
 I am not betting every positive-EV line. I am only betting selections that clear the market-specific thresholds after calibration and tail shrink. The reason is practical: the smallest positive-EV bets are exactly where the model tends to be most optimistic, so it is better to give up some volume and keep the average edge cleaner.
@@ -386,12 +388,18 @@ I am not betting every positive-EV line. I am only betting selections that clear
 
 \noindent \textbf{Question 3. ``Define Stake as the amount that you bet, calculate PnL as the Profit and Loss and RoI as PnL/Stake for each selection. (i) Calculate the overall PnL and RoI. (ii) Plot the cumulative PnL and EV as a function of time in days. (iii) Plot the 2-week rolling PnL and EV average.''}
 
-\noindent \textbf{Answer.} For stake sizing, I use Kelly rather than flat staking. The reason is that Kelly links bet size to estimated edge and current bankroll. If the estimated probabilities are correct, Kelly maximises expected log wealth. It is still aggressive, so I evaluate three fractions of Kelly instead of relying only on full Kelly.
+\noindent \textbf{Answer.} For stake sizing, I use Kelly rather than flat staking. The reason is that Kelly links bet size to estimated edge and current bankroll. More importantly, it comes from maximising expected log wealth rather than raw expected cash profit. That matters because log wealth strongly penalises paths that drive the bankroll close to zero.
 
-For a bet with model win probability \(p\) and decimal odds \(o\), the full Kelly fraction is
+For one bet with win probability \(p\), decimal odds \(o\), and stake fraction \(f\), the one-step expected log return is
+\[
+g(f)=p\log \left(1+f(o-1)\right)+(1-p)\log(1-f).
+\]
+The first-order condition gives the full Kelly fraction
 \[
 f^{*}=\frac{po-1}{o-1}.
 \]
+So Kelly is the fraction implied by maximising expected log growth. Compared with a plain EV rule, the log objective is much harsher on strategies that risk wiping out capital, because \(\log(B)\to -\infty\) as bankroll \(B\to 0\).
+
 I test three stake policies:
 \begin{itemize}
     \item \(100\%\) Kelly: \(f=f^{*}\);
@@ -440,18 +448,18 @@ Overall PnL and turnover RoI are:
 
 Under these exact bankroll constraints on partition B, the results are:
 \begin{center}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccccc}
 \toprule
-Strategy & Total PnL & Ending Bankroll & Turnover RoI & Max Drawdown \\
+Strategy & Total PnL & Ending Bankroll & Turnover RoI & Max Drawdown & Sharpe-style Proxy \\
 \midrule
-100\% Kelly & \(+1{,}241{,}259.35\) & \(1{,}241{,}359.35\) & \(23.51\%\) & \(-88.58\%\) \\
-50\% Kelly & \(+1{,}154{,}460.52\) & \(1{,}154{,}560.52\) & \(24.82\%\) & \(-44.33\%\) \\
-25\% Kelly & \(+960{,}068.68\) & \(960{,}168.68\) & \(27.24\%\) & \(-22.21\%\) \\
+100\% Kelly & \(+1{,}299{,}402.01\) & \(1{,}299{,}502.01\) & \(34.39\%\) & \(-88.35\%\) & \(5.20\) \\
+50\% Kelly & \(+1{,}249{,}139.57\) & \(1{,}249{,}239.57\) & \(36.32\%\) & \(-44.17\%\) & \(5.32\) \\
+25\% Kelly & \(+1{,}073{,}074.66\) & \(1{,}073{,}174.66\) & \(37.77\%\) & \(-22.09\%\) & \(7.82\) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-None of the three Kelly paths went bust in this realised sample, but full Kelly has extremely severe drawdowns. The most balanced line here is \(25\%\) Kelly: lower terminal PnL than full Kelly, but the highest turnover RoI and by far the mildest drawdown.
+None of the three Kelly paths went bust in this realised sample, but full Kelly has extremely severe drawdowns. The most balanced line here is \(25\%\) Kelly: lower terminal PnL than full Kelly, but the highest turnover RoI, the mildest drawdown, and the best simple Sharpe-style proxy based on daily bankroll returns. That is why I would prefer \(25\%\) Kelly in practice. The point is not to maximise the paper terminal value at all costs. The point is to maximise risk-adjusted return.
 
 \begin{figure}[htbp]
 \centering
@@ -469,7 +477,7 @@ None of the three Kelly paths went bust in this realised sample, but full Kelly 
 
 \noindent \textbf{Question 4. ``Do you think that your assumed EV is an accurate representation of your real edge? (Hint: Run a Monte Carlo simulation)''}
 
-\noindent \textbf{Answer.} Not exactly. Kelly changes the stake size, but it does not repair probability miscalibration by itself. The edge still has to come from the probability model.
+\noindent \textbf{Answer.} No. The assumed EV is a model output, not a ground truth edge. Kelly changes the stake size, but it does not repair probability miscalibration by itself. If the probability model is shifted, overconfident, or unstable, the real edge can be much smaller than the paper EV, and it can even turn negative.
 
 To test this, I run a Monte Carlo simulation on the selected bets. For each selected bet \(i\), I treat the calibrated tail probability \(p_i\) as the Bernoulli win probability, simulate the bet outcome many times, and sum the simulated PnL across the whole portfolio. Repeating that gives a distribution for total PnL under the model's own assumptions.
 
@@ -477,20 +485,40 @@ If the model's EV were perfectly calibrated, the realised PnL would sit in a fai
 
 The probability model behind the Kelly sizing was checked earlier with Monte Carlo on the selected partition-B bets:
 \begin{itemize}
-    \item actual total PnL \(=+254.02\);
-    \item Monte Carlo median PnL \(=+272.21\);
-    \item Monte Carlo 5th to 95th percentile range \(=[+175.27,\; +377.45]\);
-    \item actual percentile \(=38\)th.
+    \item actual total PnL \(=+305.09\);
+    \item Monte Carlo median PnL \(=+249.61\);
+    \item Monte Carlo 5th to 95th percentile range \(=[+181.73,\; +319.25]\);
+    \item actual percentile \(=90\)th.
 \end{itemize}
 
-So the realised outcome is below the model median, which means the model is still a bit optimistic, but it is not collapsing into the far left tail. Earlier versions of the pipeline were much worse on this point. After isotonic calibration and tail shrink, the assumed EV is not perfect, but it is much closer to a believable edge than the raw probabilities were.
+So the realised outcome is better than the model median in this sample. That is encouraging, but it still does not prove that the EV is accurate. The Monte Carlo check is only an internal consistency test. It asks: if the model probabilities were correct, would the realised PnL look plausible? It does not establish that the probabilities are stable out of sample.
 
-That matters even more once Kelly is applied, because stake size is a direct function of estimated edge. This is the main reason I prefer showing \(25\%\) and \(50\%\) Kelly alongside full Kelly rather than trusting full Kelly blindly.
+To make the stress-test idea more concrete, I also plot one pessimistic scenario. In that scenario, I cut the model edge by shrinking each selected probability \(20\%\) toward the no-vig market probability:
+\[
+p_{\text{stress}} = p_{\text{market}} + 0.8\left(p_{\text{tail}} - p_{\text{market}}\right).
+\]
+Under that stressed probability set, the Monte Carlo median falls to \(+199.32\), which sits around the 11th percentile of the original model distribution. This is a useful visual reminder that the current edge can look much less comfortable once the distribution is perturbed even mildly.
+
+The more serious failure mode is distribution shift. If the home and away means drift, if the variance layer becomes too narrow, if the tails are mis-specified, or if the bookmaker market adapts, then the realised win rate can fall below the model probability. In that case Kelly can lose money fast because the stake is a direct function of estimated edge.
+
+That is why stress testing matters. Reasonable stress tests here are:
+\begin{itemize}
+    \item shrink model probabilities toward market-implied probabilities;
+    \item push the mean predictions away from their fitted values;
+    \item widen or narrow the variance inputs;
+    \item raise fees or lower the maximum bet size;
+    \item remove the highest-EV tail and see how much of the PnL survives.
+\end{itemize}
+If the strategy only works under the exact fitted distribution, then the edge is too fragile.
+
+There is also a market-microstructure risk that the backtest does not solve: if a bookmaker detects an advantage player, it can lower the bet cap, delay acceptance, or restrict the account entirely. In that case the theoretical Kelly fraction is no longer deployable, so realised growth can be much lower than the paper path even if the raw EV estimate is correct.
+
+This is also why I prefer showing \(25\%\) and \(50\%\) Kelly alongside full Kelly rather than trusting full Kelly blindly. If the EV estimate is even slightly too high, full Kelly overreacts immediately. Fractional Kelly gives more room for model error.
 
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.82\textwidth]{../outputs/kelly_backtest/selection_edge_monte_carlo.png}
-\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets. This checks whether the model edge that feeds Kelly is believable.}
+\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets, with one stressed scenario overlaid. The stressed line uses a 20\% shrink toward market-implied probabilities to show how a mild edge haircut moves the portfolio into the lower part of the original model distribution.}
 \end{figure}
 
 \end{document}

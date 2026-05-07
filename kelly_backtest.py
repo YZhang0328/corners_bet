@@ -235,6 +235,24 @@ def simulate_kelly_path(
     return path, summary
 
 
+def daily_return_sharpe_proxy(strategy_path: pd.DataFrame) -> float:
+    """Estimate a simple Sharpe-style ratio from daily bankroll returns."""
+    if strategy_path.empty:
+        return np.nan
+    daily = (
+        strategy_path.groupby(strategy_path["date_time"].dt.date)
+        .agg(day_start_bankroll=("bankroll_before", "first"), day_pnl=("net_pnl", "sum"))
+        .reset_index(drop=True)
+    )
+    if len(daily) < 2:
+        return np.nan
+    daily_returns = daily["day_pnl"] / daily["day_start_bankroll"].replace(0.0, np.nan)
+    daily_std = float(daily_returns.std(ddof=1))
+    if np.isnan(daily_std) or daily_std <= 0.0:
+        return np.nan
+    return float(np.sqrt(252.0) * daily_returns.mean() / daily_std)
+
+
 def plot_bankroll_paths(strategy_paths: dict[str, pd.DataFrame], output_dir: Path, initial_bankroll: float) -> None:
     """Save linear, log-scale, and cumulative-PnL bankroll charts for Kelly strategies."""
     colors = {"kelly_100": "#c0392b", "kelly_50": "#e67e22", "kelly_25": "#2980b9"}
@@ -326,6 +344,7 @@ def run_kelly_backtest(
             min_fee=min_fee,
             max_bet=max_bet,
         )
+        summary["daily_return_sharpe_proxy"] = daily_return_sharpe_proxy(path)
         strategy_paths[strategy_name] = path
         summary_rows.append(summary)
 

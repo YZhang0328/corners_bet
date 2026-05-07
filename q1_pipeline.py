@@ -1898,38 +1898,6 @@ def save_outputs(
         "home_corners",
         "away_corners",
         "partition",
-        "p1x2_home_price",
-        "p1x2_away_price",
-        "p1x2_draw_price",
-        "ou_over_price",
-        "ou_under_price",
-        "ou_line",
-        "hc_home_price",
-        "hc_away_price",
-        "hc_line",
-        "market_prob_1x2_home",
-        "market_prob_1x2_away",
-        "market_prob_1x2_draw",
-        "market_prob_ou_over",
-        "market_prob_ou_under",
-        "market_prob_hc_home",
-        "market_prob_hc_away",
-        "market_home_mean",
-        "market_away_mean",
-        "market_total_mean",
-        "market_diff_mean",
-        "market_total_certainty",
-        "market_side_certainty",
-        "market_handicap_certainty",
-        "market_quantile_certainty",
-        "market_draw_prob",
-        "market_vs_model_home_gap",
-        "market_vs_model_away_gap",
-        "market_vs_model_total_gap",
-        "market_vs_model_diff_gap",
-        "market_tail_width_proxy",
-        "market_upper_tail_home_proxy",
-        "market_upper_tail_away_proxy",
         "pred_home_q10",
         "pred_home_q50",
         "pred_home_q90",
@@ -1938,8 +1906,6 @@ def save_outputs(
         "pred_away_q90",
         "quantile_sigma2_home",
         "quantile_sigma2_away",
-        "quantile_lookup_level_home",
-        "quantile_lookup_level_away",
     ]
     bet_pred = betting_match_features[
         [col for col in export_cols if col in betting_match_features.columns]
@@ -1949,7 +1915,33 @@ def save_outputs(
     bet_pred["pred_corner_diff"] = predicted_home_bet - predicted_away_bet
     bet_pred["sigma2_home"] = predicted_home_variance
     bet_pred["sigma2_away"] = predicted_away_variance
+    preferred_column_order = [
+        "match_id",
+        "date_time",
+        "competition_id",
+        "season_id",
+        "home_corners",
+        "away_corners",
+        "partition",
+        "pred_home_corners",
+        "pred_away_corners",
+        "pred_corner_diff",
+        "sigma2_home",
+        "sigma2_away",
+        "pred_home_q10",
+        "pred_home_q50",
+        "pred_home_q90",
+        "pred_away_q10",
+        "pred_away_q50",
+        "pred_away_q90",
+        "quantile_sigma2_home",
+        "quantile_sigma2_away",
+    ]
+    bet_pred = bet_pred[[col for col in preferred_column_order if col in bet_pred.columns]]
     bet_path = write_csv_with_fallback(bet_pred, output_dir / "q1_betting_match_predictions.csv")
+    outputs_q1_dir = output_dir / "outputs" / "q1"
+    outputs_q1_dir.mkdir(parents=True, exist_ok=True)
+    write_csv_with_fallback(bet_pred, outputs_q1_dir / "q1_betting_match_predictions.csv")
 
     print_heading("Save Outputs")
     print(f"Saved outputs: {model_path.name}, {val_path.name}, {bet_path.name}")
