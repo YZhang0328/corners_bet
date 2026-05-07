@@ -1,4 +1,4 @@
-# Ex1 Corner Modelling and Kelly Backtest
+# Corner Count Bidding 
 
 This repo has two main layers:
 
