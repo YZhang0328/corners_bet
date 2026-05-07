@@ -1,4 +1,4 @@
-"""Q1 pipeline: leak-free feature building, mean prediction, and variance calibration.
+"""Run the full Q1 pipeline from clean match data to exported predictions.
 
 The pipeline has three jobs:
 
@@ -147,18 +147,18 @@ class PipelineArtifacts:
 
 
 def print_heading(title: str) -> None:
-    """Print a section header for console logs."""
+    """Print a small console section header."""
     print(f"\n=== {title} ===")
 
 
 def print_frame(name: str, frame: pd.DataFrame, decimals: int = 3) -> None:
-    """Print a rounded dataframe with a preceding label."""
+    """Print a small table with a label."""
     print(f"\n{name}")
     print(frame.round(decimals).to_string())
 
 
 def write_csv_with_fallback(frame: pd.DataFrame, path: Path) -> Path:
-    """Write a CSV, falling back to `*.latest.csv` if the main file is locked."""
+    """Write one CSV file. If the file is locked, write a fallback copy."""
     try:
         frame.to_csv(path, index=False)
         return path
@@ -170,7 +170,7 @@ def write_csv_with_fallback(frame: pd.DataFrame, path: Path) -> Path:
 
 
 def irreducible_mae(poisson_mean: float, n: int = 200_000) -> float:
-    """Approximate the Poisson irreducible MAE floor by Monte Carlo sampling."""
+    """Estimate the best MAE a pure Poisson process could reach."""
     return float(np.mean(np.abs(np.random.poisson(poisson_mean, n) - poisson_mean)))
 
 
@@ -180,7 +180,7 @@ def latest_snapshot(
     snapshot: pd.DataFrame,
     cols: list[str],
 ) -> pd.DataFrame:
-    """Attach the latest per-team snapshot before each fixture for one side."""
+    """Attach the latest pre-match team row for one side of each fixture."""
     team_col = f"{side}_team_id"
     out = fixtures[["match_id", "date_time", team_col]].rename(columns={team_col: "team_id"}).copy()
     out = out.sort_values("date_time").reset_index(drop=True)
@@ -200,7 +200,7 @@ def poisson_crps(
     predicted_mean: np.ndarray,
     k_max: int = 40,
 ) -> float:
-    """Approximate Poisson CRPS by summing squared CDF errors on a finite grid."""
+    """Approximate Poisson CRPS on a finite count grid."""
     observed_array = np.asarray(observed_corners, int)
     predicted_mean_array = np.asarray(predicted_mean, float)
     corner_grid = np.arange(k_max).reshape(-1, 1)
@@ -210,7 +210,7 @@ def poisson_crps(
 
 
 def devig_two_way(price_over: float, price_under: float) -> tuple[float, float] | None:
-    """Convert 2-way decimal prices into no-vig implied probabilities."""
+    """Turn a 2-way price pair into no-vig probabilities."""
     if pd.isna(price_over) or pd.isna(price_under) or price_over <= 1 or price_under <= 1:
         return None
     inv_over = 1 / price_over
@@ -222,7 +222,7 @@ def devig_two_way(price_over: float, price_under: float) -> tuple[float, float] 
 
 
 def devig_three_way(price_home: float, price_away: float, price_draw: float) -> tuple[float, float, float] | None:
-    """Convert 3-way decimal prices into no-vig implied probabilities."""
+    """Turn a 3-way price triplet into no-vig probabilities."""
     if (
         pd.isna(price_home)
         or pd.isna(price_away)
@@ -242,26 +242,7 @@ def devig_three_way(price_home: float, price_away: float, price_draw: float) -> 
 
 
 def solve_total_mean_from_ou(line: float, prob_over: float) -> float | None:
-    """Infer a market-implied total-corners mean from a half-line OU market.
-
-    Assumption:
-        Total corners follows a Poisson distribution ~ Poisson(lambda_total)
-
-    For a half-line such as 9.5, "over" means: Total > 9.5
-
-    Since total corners are integer counts, this is equivalent to:
-            Total >= 10
-            Total > floor(9.5)
-
-    Therefore, for a given market no-vig over probability p_over, we solve:
-            P(Poisson(lambda_total) > floor(line)) = p_over
-
-    The solution lambda_total is interpreted as the market-implied expected
-    total number of corners.
-
-    Only half-lines are inverted here because they have no push outcome.
-    Integer lines would require explicit push handling.
-    """
+    """Infer the market's total-corner mean from one OU line and price."""
     if pd.isna(line) or pd.isna(prob_over):
         return None
     
@@ -293,36 +274,7 @@ def skellam_probabilities(
     predicted_home_mean: float,
     predicted_away_mean: float,
 ) -> tuple[float, float, float]:
-    
-    """Convert home/away expected corners into 1X2 corner probabilities.
-
-    Assumption:
-        Home corners and away corners are independent Poisson variables:
-
-            Home ~ Poisson(mu_home)
-            Away ~ Poisson(mu_away)
-
-        Then their difference:
-
-            D = Home - Away
-
-        follows a Skellam distribution:
-
-            D ~ Skellam(mu_home, mu_away)
-
-    The 1X2 corner market can then be computed as:
-
-        home wins corners: D > 0
-        draw in corners:  D = 0
-        away wins corners: D < 0
-
-    Returns:
-        (prob_home, prob_away, prob_draw)
-
-    Note:
-        The return order is home, away, draw. Be careful not to treat it
-        as home, draw, away.
-    """
+    """Turn home and away means into home, draw, and away probabilities."""
 
     prob_draw = float(skellam.pmf(0, predicted_home_mean, predicted_away_mean))
     prob_away = float(skellam.cdf(-1, predicted_home_mean, predicted_away_mean))
@@ -336,7 +288,7 @@ def solve_home_away_means_from_market(
     prob_away: float,
     prob_draw: float,
 ) -> tuple[float, float] | None:
-    """Split a total-corners mean into home/away means that match 1X2 prices."""
+    """Split a total mean into home and away means that best match 1X2 prices."""
     if total_mean <= 0:
         return None
 
@@ -365,7 +317,7 @@ def solve_home_away_means_from_market(
 
 
 def infer_market_means_for_row(row: pd.Series) -> tuple[float, float] | None:
-    """Infer market-implied home/away corner means from OU and 1X2 prices."""
+    """Infer market-implied home and away means from one price row."""
     devig_ou = devig_two_way(row["ou_over_price"], row["ou_under_price"])
     devig_1x2 = devig_three_way(row["p1x2_home_price"], row["p1x2_away_price"], row["p1x2_draw_price"])
     if devig_ou is None or devig_1x2 is None:
@@ -379,8 +331,7 @@ def infer_market_means_for_row(row: pd.Series) -> tuple[float, float] | None:
 
 
 def compute_market_feature_row(row: pd.Series) -> pd.Series:
-    """Turn raw 1X2/OU/HC prices into one row of abstract market features.
-    Use devigged probabilities to compute market-implied team strength features"""
+    """Turn one row of raw prices into cleaner market features."""
     probs_1x2 = devig_three_way(row.get("p1x2_home_price"), row.get("p1x2_away_price"), row.get("p1x2_draw_price"))
     probs_ou = devig_two_way(row.get("ou_over_price"), row.get("ou_under_price"))
     probs_hc = devig_two_way(row.get("hc_home_price"), row.get("hc_away_price"))
@@ -449,7 +400,7 @@ def compute_market_feature_row(row: pd.Series) -> pd.Series:
 
 
 def quantile_bucket_edges(values: pd.Series, bucket_count: int = RESIDUAL_QUANTILE_BUCKETS) -> np.ndarray:
-    """Create stable bucket edges from empirical quantiles, with open tails."""
+    """Build quantile bucket edges with open tails."""
     clean_values = pd.Series(values).replace([np.inf, -np.inf], np.nan).dropna()
     if clean_values.empty:
         return np.array([-np.inf, np.inf], dtype=float)
@@ -463,7 +414,7 @@ def quantile_bucket_edges(values: pd.Series, bucket_count: int = RESIDUAL_QUANTI
 
 
 def assign_bucket_codes(values: pd.Series, edges: np.ndarray) -> pd.Series:
-    """Map continuous values into integer bucket codes defined by quantile edges."""
+    """Map continuous values into integer bucket IDs."""
     if len(edges) <= 2:
         return pd.Series(np.zeros(len(values), dtype=int), index=values.index)
     bucket_codes = pd.cut(values, bins=edges, labels=False, include_lowest=True)
@@ -479,7 +430,7 @@ def fit_residual_quantile_lookup(
     gap_col: str,
     side_name: str,
 ) -> dict[str, object]:
-    """Fit fallback residual-quantile lookup tables from partition-A rows."""
+    """Fit residual quantile lookup tables on partition A."""
     work = calibration_rows[
         [prediction_col, actual_col, certainty_col, rolling_std_col, gap_col]
     ].copy()
@@ -560,7 +511,7 @@ def apply_residual_quantile_lookup(
     target_rows: pd.DataFrame,
     lookup: dict[str, object],
 ) -> pd.DataFrame:
-    """Apply one fitted residual-quantile lookup to any target rows."""
+    """Apply one residual quantile lookup table to new rows."""
     work = target_rows.copy()
     prediction_col = str(lookup["prediction_col"])
     certainty_col = str(lookup["certainty_col"])
@@ -630,7 +581,7 @@ def attach_market_quantile_features(
     predicted_away_bet: np.ndarray,
     global_std_c: float,
 ) -> pd.DataFrame:
-    """Build market abstractions and conditional residual quantiles from A, then apply them to B."""
+    """Build market-based quantile features and attach them to betting rows."""
     enriched = betting_match_features.copy()
     enriched["predicted_home_mean"] = predicted_home_bet
     enriched["predicted_away_mean"] = predicted_away_bet
@@ -754,7 +705,7 @@ def fit_market_teacher(
     x_val: pd.DataFrame | None = None,
     y_val: pd.Series | None = None,
 ) -> LGBMRegressor:
-    """Fit a LightGBM teacher that mimics market-implied corner means."""
+    """Fit a teacher model that copies the market-implied corner means."""
     model = LGBMRegressor(
         objective="regression",
         metric="rmse",
@@ -778,7 +729,7 @@ def fit_market_teacher(
 
 
 def optimise_blend_weight(base_pred: np.ndarray, teacher_pred: np.ndarray, observed: np.ndarray) -> float:
-    """Choose a simple blend weight that minimises MAE on a small grid."""
+    """Choose the blend weight that gives the lowest MAE on a small grid."""
     grid = np.linspace(0.0, 1.0, 21)
     best_weight = 0.0
     best_mae = np.inf
@@ -798,7 +749,7 @@ def evaluate_predictions(
     predicted_home_corners: np.ndarray,
     predicted_away_corners: np.ndarray,
 ) -> dict[str, float | str]:
-    """Compute validation metrics for home, away, and corner-difference targets."""
+    """Compute the main validation metrics."""
     actual_corner_diff = actual_home_corners - actual_away_corners
     predicted_corner_diff = predicted_home_corners - predicted_away_corners
     return {
@@ -819,7 +770,7 @@ def evaluate_predictions(
 def load_inputs(
     data_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load cleaned parquet inputs and align the training universe to betting leagues."""
+    """Load the clean input tables and align training to the betting leagues."""
     train = pd.read_parquet(data_dir / "train.parquet")
     betting = pd.read_parquet(data_dir / "betting.parquet")
     all_matches = pd.read_parquet(data_dir / "all_matches.parquet")
@@ -843,7 +794,7 @@ def load_inputs(
 
 
 def baseline_diagnostics(model_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Summarise raw dispersion and the irreducible Poisson MAE floor."""
+    """Print basic dispersion stats and the Poisson error floor."""
     targets = ["home_corners", "away_corners", "total_corners"]
     disp = pd.DataFrame(
         {
@@ -877,7 +828,7 @@ def build_strength_features(
     model_data: pd.DataFrame,
     betting_matches: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Generate leak-free team-strength features for train and betting fixtures."""
+    """Build leak-free team-strength features for train and betting matches."""
     target_match_ids = set(model_data["match_id"].astype(int)) | set(betting_matches["match_id"].astype(int))
     strength_features = walk_matches(all_matches, target_match_ids)
 
@@ -894,7 +845,7 @@ def build_strength_features(
 
 
 def build_team_games(model_data: pd.DataFrame) -> pd.DataFrame:
-    """Convert match rows into a one-row-per-team-per-match table."""
+    """Turn match rows into one row per team per match."""
     home_rows = model_data[
         [
             "match_id",
@@ -951,7 +902,7 @@ def build_team_games(model_data: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_rolling_features(team_games: pd.DataFrame) -> pd.DataFrame:
-    """Add rolling corner and goal summaries to the per-team match table."""
+    """Add rolling corner and goal features to the team table."""
     team_games = team_games.copy()
     team_games["corners_for_ewm_half_life_5"] = team_games.groupby("team_id")["corners_for"].transform(
         lambda series: series.shift(1).ewm(halflife=5, ignore_na=True).mean()
@@ -999,7 +950,7 @@ def build_match_features(
     team_games: pd.DataFrame,
     strength_features: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Assemble the final match-level design matrices for train and betting sets."""
+    """Build the final match-level feature tables."""
     home_feats = team_games[team_games["is_home"] == 1][["match_id"] + TEAM_FEATURE_COLS].rename(
         columns={col: f"home_{col}" for col in TEAM_FEATURE_COLS}
     )
@@ -1081,7 +1032,7 @@ def fill_missing_features(
     features: pd.DataFrame,
     betting_match_features: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, float]:
-    """Fill engineered-feature nulls and report the remaining data quality picture."""
+    """Fill missing engineered features and report what changed."""
     meta_cols = {
         "match_id",
         "date_time",
@@ -1185,7 +1136,7 @@ def split_train_val(
     features: pd.DataFrame,
     betting_match_features: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split the match feature table into chronological train and validation sets."""
+    """Split the match table into time-ordered train and validation sets."""
     cutoff = features["date_time"].quantile(0.8)
     train_feat = features[features["date_time"] < cutoff].copy()
     val_feat = features[features["date_time"] >= cutoff].copy()
@@ -1229,7 +1180,7 @@ def fit_mean_models(
     train_feat: pd.DataFrame,
     val_feat: pd.DataFrame,
 ) -> tuple[LGBMRegressor, LGBMRegressor, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """Fit the stage-2 home and away corner mean models."""
+    """Fit the home and away corner mean models."""
     train_features = train_feat[FEATURE_COLS]
     val_features = val_feat[FEATURE_COLS]
     actual_home_train = train_feat["home_corners"]
@@ -1302,7 +1253,7 @@ def fit_mean_models(
 
 
 def distance_to_floor(bound: pd.DataFrame, results: pd.DataFrame) -> pd.DataFrame:
-    """Compare the model's MAE against the baseline and Poisson error floor."""
+    """Compare model MAE with the baseline and Poisson floor."""
     floor = bound.set_index("target")["simulated_MAE"]
     baseline = results[results["model"] == "Mean baseline"].iloc[0]
     best = results[results["model"] == "LGB"].iloc[0]
@@ -1334,7 +1285,7 @@ def stage3_calibration(
     actual_away_val: pd.Series,
     global_std_c: float,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
-    """Fit dispersion heads and bias-correct holdout mean predictions."""
+    """Fit the variance heads and apply the main holdout corrections."""
     print_heading("Stage 3")
     for side_name, predicted_corners, actual_corners in [
         ("home", predicted_home_val, actual_home_val),
@@ -1504,7 +1455,7 @@ def make_mean_calibration_plot(
     predicted_home_val: np.ndarray,
     predicted_away_val: np.ndarray,
 ) -> None:
-    """Create mean-calibration and trend charts for the Q1 mean model."""
+    """Draw the main mean-calibration plots for Q1."""
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     for ax, y_series, mu, name in [
         (axes[0], y_val_h, predicted_home_val, "Home"),
@@ -1583,7 +1534,7 @@ def make_distribution_plot(
     predicted_away_val: np.ndarray,
     calibration: dict[str, object],
 ) -> dict[str, float]:
-    """Visualise empirical vs modeled count distributions on validation data."""
+    """Draw the validation distribution check plots."""
     dispersion_home = calibration["dispersion_home"]
     dispersion_away = calibration["dispersion_away"]
     global_std_c = float(calibration["global_std_c"])
@@ -1692,7 +1643,7 @@ def apply_global_mean_correction(
     betting_match_features: pd.DataFrame,
     calibration: dict[str, object],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Add a late-window drift correction to partition-A betting predictions."""
+    """Apply the late-window mean correction to betting predictions."""
     a_mask = calibration["a_mask"]
     adjusted_home_bet = np.asarray(calibration["predicted_home_bet_adjusted"]).copy()
     adjusted_away_bet = np.asarray(calibration["predicted_away_bet_adjusted"]).copy()
@@ -1743,7 +1694,7 @@ def apply_market_teacher_adjustment(
     predicted_home_bet: np.ndarray,
     predicted_away_bet: np.ndarray,
 ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    """Blend base Q1 predictions with a market-implied teacher on partition B."""
+    """Blend the base Q1 means with the market-teacher means on partition B."""
     market_frame = betting_match_features.copy()
     market_frame["base_pred_home"] = predicted_home_bet
     market_frame["base_pred_away"] = predicted_away_bet
@@ -1881,7 +1832,7 @@ def save_outputs(
     predicted_home_variance: np.ndarray,
     predicted_away_variance: np.ndarray,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Persist Q1 validation and betting predictions to CSV files."""
+    """Write the Q1 validation and betting prediction files."""
     model_path = write_csv_with_fallback(results, output_dir / "q1_model_comparison.csv")
 
     val_keep = ["match_id", "date_time", "competition_id", "season_id", "home_corners", "away_corners"]
@@ -1956,7 +1907,7 @@ def save_outputs(
 
 
 def run_pipeline(data_dir: str | Path = ".", save_outputs_flag: bool = True, make_plots: bool = True) -> PipelineArtifacts:
-    """Run the full Q1 feature, mean, calibration, and export pipeline."""
+    """Run the full Q1 pipeline."""
     data_path = Path(data_dir)
     train, betting, all_matches, model_data, betting_matches = load_inputs(data_path)
     _, bound = baseline_diagnostics(model_data)

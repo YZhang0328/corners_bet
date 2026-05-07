@@ -56,9 +56,10 @@ python kelly_backtest.py --output-dir outputs/kelly_backtest --initial-bankroll 
 
 ## Current Kelly assumptions
 
+- EV thresholds are tuned on partition `A` and then frozen before evaluating partition `B`.
 - `1X2` bet only if `EV > 0.03`
 - `HC` bet only if `EV > 0.023`
-- `OU` bet only if `EV > 0.03`
+- `OU` bet only if `EV > 0.035`
 - initial bankroll = `100`
 - fee rate = `3%`
 - minimum fee = `0.1`

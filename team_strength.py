@@ -1,6 +1,14 @@
-"""Sequential Bayesian Poisson team-strength estimator.
+"""Sequential team-strength estimator for football corners.
 
-For each team we maintain four latent skills, all in log-corner space:
+The goal is simple:
+
+- keep a running estimate of how good each team is at *winning* corners;
+- keep a running estimate of how likely each team is to *allow* corners;
+- update those estimates match by match in time order;
+- only expose pre-match information to the downstream Q1 model.
+
+For each team we maintain four venue-specific latent skills, all in
+log-corner space:
 
     alpha_at_home      -- attack rating when playing at home
     delta_at_home      -- defensive leakiness when playing at home
@@ -12,16 +20,21 @@ A general (venue-pooled) attack and defence rating are also maintained:
     alpha              -- attack rating (any venue)
     delta              -- defensive leakiness (any venue)
 
-The model assumes corners are Poisson with log-additive rates:
+The core assumption is that expected corner intensity is log-additive:
 
     log(lambda_home) = league_log_baseline_home + alpha_home + delta_away
     log(lambda_away) = league_log_baseline_away + alpha_away + delta_home
 
-After observing a match's actual corners we update each latent in the
-direction of the log-residual, with a per-team learning rate that
-shrinks as the team accumulates a longer history. This is a sequential
-SGD interpretation of Bayesian shrinkage to the league prior, in the
-spirit of Elo and Dixon-Coles models.
+After a match finishes, we compare:
+
+- what the model expected before kickoff; and
+- what actually happened.
+
+If a team wins more corners than expected, its attack rating moves up.
+If a team allows more opponent corners than expected, its defensive
+leakiness moves up. Teams with little history move faster. Teams with
+long history move more slowly. This is an Elo-style online update,
+adapted from win/loss ratings to corner production and concession.
 
 The walker iterates matches in chronological order. Features for a
 match are *read* before that match's update is applied, so they only
@@ -39,31 +52,17 @@ import pandas as pd
 
 
 DEFAULT_PRIOR_STRENGTH: int = 15
-"""Number of matches at which a team's own history weights equally with the
-league prior. Sets the half-life of the per-team learning-rate decay."""
+"""Controls how quickly a new team's rating can move away from the league prior."""
 
 DEFAULT_MAX_LEARNING_RATE: float = 0.10
-"""Initial learning rate, applied when a team has zero prior matches."""
+"""Largest update size used when a team has almost no prior history."""
 
 LOG_RESIDUAL_SMOOTHING: float = 0.5
-"""Constant added inside log() so that zero corners give a finite residual."""
+"""Small smoothing constant so that zero corners still produce a finite log residual."""
 
 
 def compute_league_baselines(matches: pd.DataFrame) -> pd.DataFrame:
-    """Per-match league baseline corner rates on the log scale.
-
-    For each (competition_id, season_id), an expanding mean of corners
-    from matches strictly before the current row. Filled with the global
-    mean for the first match of each (competition, season). Returned on
-    the log scale, clipped at log(1) for numerical safety.
-
-    Inputs:
-        matches: must include match_id, date_time, competition_id,
-                 season_id, home_corners, away_corners.
-
-    Returns DataFrame with columns:
-        match_id, league_log_baseline_home, league_log_baseline_away
-    """
+    """Build the running league baseline before each match."""
     sorted_matches = matches.sort_values(['competition_id', 'season_id', 'date_time']).copy()
     grouped = sorted_matches.groupby(['competition_id', 'season_id'])
 
@@ -83,27 +82,13 @@ def compute_league_baselines(matches: pd.DataFrame) -> pd.DataFrame:
 
 
 class TeamStrengthEstimator:
-    """Holds per-team rating state and updates it from match outcomes.
+    """Store team ratings and update them after each match.
 
-    Maintains six floats per team (general attack/defence plus four
-    venue-specific ratings) and a count of prior matches used for the
-    learning-rate decay.
-
-    Math:
-        log(lambda_home) = league_log_baseline_home + alpha_home + delta_away
-        log(lambda_away) = league_log_baseline_away + alpha_away + delta_home
-
-        After observing actual corners (y_h, y_a):
-            home_log_residual = log(y_h + 0.5) - log(lambda_home)
-            away_log_residual = log(y_a + 0.5) - log(lambda_away)
-
-        Each latent that contributed to a rate moves by half the
-        residual scaled by the team's learning rate, so the rate moves
-        by exactly the residual.
-
-        learning_rate(team) =
-            max_learning_rate * prior_strength
-                / (prior_match_count(team) + prior_strength)
+    Each team has attack and defensive-leakiness ratings, both overall
+    and split by venue. These ratings are learned online from past
+    matches. If a team wins more corners than expected, its attack
+    rating goes up. If it allows more corners than expected, its
+    defensive leakiness goes up.
     """
 
     def __init__(self,
@@ -129,12 +114,24 @@ class TeamStrengthEstimator:
                       away_team_id: int,
                       league_log_baseline_home: float,
                       league_log_baseline_away: float) -> dict[str, float]:
-        """Snapshot ratings for a match before any update is applied.
+        """Read the team's current ratings before this match is learned from.
 
-        Returned columns mirror what the GBT consumes downstream. The
-        log-rate fields are computed from the *general* (venue-pooled)
-        ratings; venue-specific ratings are returned alongside so the
-        GBT can split on either view.
+        This is the leak-free pre-match snapshot that Q1 consumes.
+        Think of it as:
+
+        - what do we believe about the home team right now?
+        - what do we believe about the away team right now?
+        - if the match started now, what corner rates would those
+          beliefs imply?
+
+        The returned columns are exactly the features used downstream by
+        the gradient-boosted tree model in Q1.
+
+        Two views are returned:
+
+        - general ratings, pooled across all venues;
+        - venue-specific ratings, so Q1 can learn separate home and
+          away effects if that helps.
         """
         home_team_overall_attack = self.overall_attack_rating[home_team_id]
         home_team_overall_defence = self.overall_defence_leakiness[home_team_id]
@@ -171,12 +168,26 @@ class TeamStrengthEstimator:
                             away_corners: float,
                             league_log_baseline_home: float,
                             league_log_baseline_away: float) -> None:
-        """Move ratings toward the observed corner counts.
+        """Update team ratings after the match result is known.
 
-        Updates four general latents (home/away attack, home/away
-        defence) and four venue-specific latents (home team's at-home,
-        away team's at-away). Increments the prior match count for both
-        teams.
+        Plain-language version:
+
+        - first compute what the model expected before kickoff;
+        - compare that with the actual home and away corner counts;
+        - if a team did better than expected, strengthen the ratings
+          that helped produce that outcome;
+        - if a team did worse than expected, weaken those ratings.
+
+        Example:
+
+        - if the home team wins more corners than expected, increase the
+          home attack rating and increase the away defensive leakiness;
+        - if the away team wins more corners than expected, increase the
+          away attack rating and increase the home defensive leakiness.
+
+        We update both the general ratings and the venue-specific
+        ratings, then increment each team's match count so future
+        updates become a bit smaller.
         """
         predicted_home_log_rate = (
             league_log_baseline_home
@@ -195,18 +206,19 @@ class TeamStrengthEstimator:
         home_team_learning_rate = self._learning_rate(home_team_id)
         away_team_learning_rate = self._learning_rate(away_team_id)
 
-        # General (venue-pooled) ratings: each rate is alpha + delta, so
-        # split the residual evenly so that both latents move by half
-        # and the sum (the rate) moves by the full residual.
+        # General ratings:
+        # home corners above expectation -> raise home attack and away leakiness
+        # away corners above expectation -> raise away attack and home leakiness
+        # We split each residual in half so the attack side and defence side
+        # share the update.
         self.overall_attack_rating[home_team_id] += 0.5 * home_team_learning_rate * home_team_log_residual
         self.overall_defence_leakiness[away_team_id] += 0.5 * away_team_learning_rate * home_team_log_residual
         self.overall_attack_rating[away_team_id] += 0.5 * away_team_learning_rate * away_team_log_residual
         self.overall_defence_leakiness[home_team_id] += 0.5 * home_team_learning_rate * away_team_log_residual
 
-        # Venue-specific ratings: home team's at-home pair updates from
-        # this match (they played at home), away team's at-away pair
-        # updates from this match (they played away). The other team's
-        # ratings at the *opposite* venue are untouched.
+        # Venue-specific ratings:
+        # this match only teaches us about the home team's "at home"
+        # behaviour and the away team's "away" behaviour.
         self.home_attack_rating[home_team_id] += 0.5 * home_team_learning_rate * home_team_log_residual
         self.home_defence_leakiness[home_team_id] += 0.5 * home_team_learning_rate * away_team_log_residual
         self.away_attack_rating[away_team_id] += 0.5 * away_team_learning_rate * away_team_log_residual
@@ -220,24 +232,7 @@ def walk_matches(matches: pd.DataFrame,
                  target_match_ids: Iterable[int],
                  prior_strength: int = DEFAULT_PRIOR_STRENGTH,
                  max_learning_rate: float = DEFAULT_MAX_LEARNING_RATE) -> pd.DataFrame:
-    """Walk every match chronologically, emitting features for targets.
-
-    Iterates `matches` in (date_time, match_id) order. For each match:
-    - if it is in `target_match_ids`, snapshot the current ratings as
-      features (read before update);
-    - if its corners are observed (non-NaN), apply the update.
-
-    Inputs:
-        matches: DataFrame with at least match_id, date_time,
-                 home_team_id, away_team_id, competition_id, season_id,
-                 home_corners, away_corners. The walker uses this set
-                 both to drive updates and as the universe of matches
-                 to iterate; matches with NaN corners are read-only.
-        target_match_ids: set of match_ids for which to emit features.
-
-    Returns one row per target match_id with the columns from
-    TeamStrengthEstimator.read_features plus 'match_id'.
-    """
+    """Walk through matches in time order and emit leak-free team features."""
     target_set = set(int(m) for m in target_match_ids)
 
     baselines = compute_league_baselines(matches).set_index('match_id')

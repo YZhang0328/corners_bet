@@ -1,2 +1,2 @@
 actual_total_pnl,base_median_pnl,base_q05_pnl,base_q95_pnl,stress_definition,stress_median_pnl,stress_q05_pnl,stress_q95_pnl,stress_median_percentile_in_base_mc
-305.087,249.608,181.73245,319.24685,p_stress = p_market + 0.72 * (p_tail - p_market),179.1635,109.9308,249.21699999999998,4.36
+303.48699999999997,249.566,181.92309999999998,319.4042499999999,p_stress = p_market + 0.73 * (p_tail - p_market),182.4305,112.9525,252.45839999999993,5.11

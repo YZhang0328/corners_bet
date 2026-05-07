@@ -26,15 +26,15 @@
 \vspace{0.3cm}
 
 {\itshape
-\textbf{Summary:} Predicting exact home and away corners is hard, so the model should not stop at point forecasts. The useful step is to combine home and away means, variances, and market-aware calibration into a betting distribution.
+\textbf{Summary:} Predicting exact home and away corners is hard, so the model should not stop at point forecasts. The useful step is to turn home and away means, variances, and market-aware calibration into a betting distribution.
 
 \par\vspace{0.25cm}
 
-Once that distribution is good enough, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better Sharpe-ratio-like risk-adjusted profile, which matters more here than maximising cash. Just as importantly, Kelly is highly sensitive to probability error, so stress testing is not optional.
+Once that distribution is believable, Kelly can compound capital even under realistic fees and stake caps, but full Kelly is too aggressive in practice. Fractional Kelly is more sensible because it gives a better Sharpe-ratio-like risk-adjusted profile, which matters more here than maximising terminal cash.
 
 \par\vspace{0.25cm}
 
-Questions 2 and 3 are standard at the formula level: EV, distributions, and Kelly are well known. The real issue is whether the model probabilities behind those formulas are believable. That is why the assumptions have to be checked, especially with Monte Carlo. If the EV is not credible, Kelly is not credible either.
+Questions 2 and 3 are standard at the formula level: EV, distributions, and Kelly are well known. The real issue is whether the model probabilities behind those formulas are believable. That is why the assumptions have to be checked, especially with Monte Carlo. If the EV is not credible, Kelly is not credible either, and because Kelly is highly sensitive to probability error, stress testing is not optional.
 
 }
 
@@ -50,7 +50,7 @@ including data exploration, features and model selection/comparison, model valid
 \rightarrow
 \texttt{q1\_pipeline.py}
 \]
-Inside \texttt{q1\_pipeline.py}, Stage 1a calls \texttt{team\_strength.py} and Stage 3 calls \texttt{team\_variance.py}. In practice the order is:
+Inside \texttt{q1\_pipeline.py}, two sub-modules are fitted: \texttt{team\_strength.py} and \texttt{team\_variance.py}. The execution order is:
 \begin{enumerate}
     \item \texttt{data\_cleaning.ipynb} does the data preprocessing.
     \item \texttt{q1\_pipeline.py} loads those parquet files and builds the full Q1 dataset.
@@ -65,7 +65,20 @@ So \texttt{q1\_pipeline.py} is the orchestrator, while \texttt{team\_strength.py
 
 \noindent \textbf{Data exploration:}
 
-\noindent See data\_cleaning.ipynb. It reads the raw CSV files, removes outliers (999 in corners data csv) and conflicting records, only keeps the first occurrence of the duplicate records. It also removes $<$ 1 odds for oh and oa, and negative od odds in "OU" and "1X2". After done these steps, 7 team's corner records are missing from corner data. These are filled by matching the records from the price tables (market odds are not involved in this stage). The clean tables are written to \texttt{train.parquet}, \texttt{betting.parquet}, and \texttt{all\_matches.parquet}.\\
+\noindent See \texttt{data\_cleaning.ipynb}. The exploration step is simple but important: first check row counts, date ranges, duplicate match keys, impossible values, and missing coverage across the raw match and price tables. Then the cleaning pass removes the obvious bad rows: the corner outlier value \(999\), conflicting records, duplicate rows after the first occurrence, odds below \(1\) for \texttt{oh}/\texttt{oa}, and negative \texttt{od} values inside the OU and 1X2 tables. After that, 7 teams still have missing corner history in the raw match file, so those match identities are repaired by matching against the price tables. The market odds themselves are not used as features at this stage; they are only used to recover the missing match records. The cleaned outputs are written to \texttt{train.parquet}, \texttt{betting.parquet}, and \texttt{all\_matches.parquet}.\\
+
+\noindent \textbf{Train / validation / test split:}
+
+\noindent The split is fully time ordered.
+\begin{itemize}
+    \item Q1 model window: \(11{,}198\) matches from 2020-08-08 to 2024-12-08.
+    \item Q1 train split: \(8{,}956\) matches from 2020-08-08 to 2023-10-21.
+    \item Q1 validation split: \(2{,}242\) matches from 2023-10-21 to 2024-12-08.
+    \item Betting holdout window: \(1{,}911\) matches from 2024-08-09 to 2025-05-11.
+    \item Betting partition A: \(764\) matches from 2024-08-09 to 2024-12-14 15:00.
+    \item Betting partition B: \(1{,}147\) matches from 2024-12-14 15:15 to 2025-05-11.
+\end{itemize}
+The point of this layout is to keep the roles separate. The Q1 mean model is fitted on the historical train block and checked on a later validation block. The later betting window is never used to fit the mean head. Inside that betting window, partition A is only for calibration and threshold tuning, and partition B is reserved for the final out-of-sample betting evaluation.
 
 
 \noindent \textbf{What does Q1 actually predict for one match, and where do mean and variance enter?}
@@ -103,7 +116,7 @@ In classical Elo, each team has one rating and the update is driven by whether t
     \item an attack rating: how much the team tends to create corners;
     \item a defence leakiness rating: how many corners the team tends to allow.
 \end{itemize}
-The model walks through matches in chronological order. Before updating anything, it reads the current ratings and builds the features for that match. Only after the match is observed does it update the two teams' ratings. That detail matters, because it means every row only uses information that was available \emph{before kickoff}. There is no look-ahead leakage.
+The model walks through matches in chronological order. Before updating anything, it reads the current ratings and builds the features for that match. Only after the match is observed does it update the two teams' ratings. Every row only uses information that was available. There is no look-ahead leakage.
 
 The core abstraction is:
 \[
@@ -124,7 +137,7 @@ The core abstraction is:
 +
 \text{home defensive leakiness}.
 \]
-Here \(\lambda_{home}\) and \(\lambda_{away}\) are the expected home and away corner rates before the match starts. After the match ends, the model compares the realised corners with these expected rates on the log scale and nudges the two teams' latent ratings up or down. Teams with little history move faster. Teams with long history move more slowly. That is what the prior-strength and learning-rate terms are doing.
+See team\_strength.read\_features. Here \(\lambda_{home}\) and \(\lambda_{away}\) are the expected home and away corner rates before the match starts. After the match ends, the model compares the realised corners with these expected rates on the log scale and nudges the two teams' latent ratings up or down. Teams with little history move faster. Teams with long history move more slowly. That is what the prior-strength and learning-rate terms are doing.
 
 So the Elo idea appears in the mechanics:
 \begin{itemize}
@@ -143,8 +156,7 @@ This block exports the following pre-match features:
     \item overall strength difference;
     \item venue-adjusted strength difference.
 \end{itemize}
-The block answers: how strong is each team at winning corners, how weak is it at preventing them, and how much of that signal changes between home and away.
-These Elo-style outputs are not used as stand-alone predictions. They are fed into the mean model as part of the feature vector. In other words, the LightGBM model looks at variables such as \texttt{home\_attack\_rating}, \texttt{away\_defence\_leakiness}, \texttt{log\_lambda\_home}, and \texttt{strength\_diff}, then learns how those pre-match strength snapshots map into actual home and away corner counts.
+The block answers: how strong is each team at winning corners, how weak is it at preventing them.
 
 \bigskip
 
@@ -192,11 +204,6 @@ The idea is simple: recent corner flow tells us whether a team is currently prod
 \end{itemize}
 These do not predict corners directly, but they help because style and game state matter. Teams playing on the front foot tend to create different corner profiles from teams sitting deep or chasing games.
 
-All rolling features are built from a per-team match table. One original match becomes two rows:
-\begin{itemize}
-    \item one row from the home team's point of view;
-    \item one row from the away team's point of view.
-\end{itemize}
 For each team row, I record:
 \begin{itemize}
     \item \texttt{corners\_for}: corners won by that team in that match;
@@ -264,7 +271,7 @@ So the gain over baseline is:
     \item corner-difference MAE improves by \(0.2163\).
 \end{itemize}
 
-That is not a huge jump, but it is real, stable, and achieved without leaking holdout information into the mean head. The bigger practical win is that Q1 is not only a slightly better point predictor than the constant mean baseline. It also exports a much richer distributional object that Q2 can actually bet on.
+That is not a huge jump, but it is real, stable, and achieved without leaking holdout information into the mean head. A useful way to read it is against the practical lower bound in this dataset. For home corners, the irreducible error floor is about \(1.86\), while the constant-mean baseline sits at \(2.39\) and the model brings that down to \(2.28\). So the model removes about \(0.11\) errors per match, out of roughly \(0.53\) errors that were realistically available to remove. For away corners, the floor is about \(1.70\), the baseline is \(2.09\), and the model improves it to \(1.99\), again removing about \(0.10\) errors per match out of roughly \(0.40\) that were realistically available. In plain terms: the model is not close to the theoretical limit, but it is moving in the right direction and doing so consistently. The bigger practical win is that Q1 is not only a slightly better point predictor than the constant mean baseline. It also exports a much richer distributional object that Q2 can actually bet on.
 
 \bigskip
 
@@ -301,21 +308,6 @@ It is:
 \]
 That matters because Q2 needs a distribution, not just a point estimate. The mean tells Q2 where the centre is. The variance and quantile anchors tell Q2 how wide the distribution should be and how cautious it should be in the tails.
 
-In the current pipeline, Q2 turns those Q1 outputs into market probabilities in the following way:
-\begin{enumerate}
-    \item treat \(\hat{\mu}_{home}, \hat{\sigma}^{2}_{home}\) as the first two moments of the home-corner count;
-    \item treat \(\hat{\mu}_{away}, \hat{\sigma}^{2}_{away}\) as the first two moments of the away-corner count;
-    \item convert those moments into a negative-binomial parameterisation for the two team-level count distributions;
-    \item combine the two team distributions into total-corner and corner-difference distributions, with an extra shared-correlation correction estimated on partition A;
-    \item use the \(q10/q50/q90\) anchors as a guardrail when a quoted market line is far outside Q1's own empirical range.
-\end{enumerate}
-So the split of responsibilities is clean:
-\begin{itemize}
-    \item Q1 predicts the centre and spread of each team's corner count;
-    \item Q2 converts that into probabilities for over/under, handicap, and 1X2 betting markets.
-\end{itemize}
-This is why mean and variance are enough for the next step. Once Q1 gives a centre and a spread for the home side, and a centre and a spread for the away side, Q2 can build approximate count distributions for both teams. From those distributions it can compute the probability of total corners going over a line, the probability of home corners beating away corners, and the probability of home, draw, or away in the corner 1X2 market.
-
 \bigskip
 
 \noindent \textbf{Question 2. Using your model from Q1, (a) calculate EV as the expected value of a bet, and (b) how many selections are you betting? Why?}
@@ -351,6 +343,12 @@ These moments are then converted into market probabilities in two different ways
     \item for HC and 1X2, use the corner-difference mean and variance to approximate a distribution for \(D=C_{home}-C_{away}\), then compute the probability of home, draw, or away relative to the quoted line.
 \end{itemize}
 
+The reason for using negative binomial: total corners are non-negative counts, so the distribution has to live on \(0,1,2,\dots\). A Poisson would be the simplest count model, but Poisson hard-wires the variance to equal the mean. That is too narrow here, because the model already says how wide the total should be through \(\mu_{total}\) and \(\sigma^2_{total}\), and in practice \(\sigma^2_{total}\) is often larger than \(\mu_{total}\). The negative binomial is the standard next step because it is still a count distribution, but it can match both the centre and the spread:
+\[
+\mathbb{E}[T]=\mu_{total}, \qquad \mathrm{Var}(T)=\mu_{total}+\frac{\mu_{total}^2}{r}.
+\]
+So once \(\mu_{total}\) and \(\sigma^2_{total}\) are fixed, \(r\) is chosen to make the variance line up as well. In plain terms, OU needs a distribution for a whole-number total, and negative binomial is the simplest way to keep the count structure while letting the tails be wider than Poisson.
+
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.92\textwidth]{../outputs/kelly_backtest/probability_construction.png}
@@ -369,17 +367,27 @@ Under the current default settings, the selection rule is:
 \begin{itemize}
     \item bet 1X2 only if \(\text{EV} > 0.03\);
     \item bet HC only if \(\text{EV} > 0.023\);
-    \item bet OU only if \(\text{EV} > 0.03\).
+    \item bet OU only if \(\text{EV} > 0.035\).
 \end{itemize}
 
-These thresholds were not chosen arbitrarily. After calibration and tail shrink, 1X2 remained the weakest and noisiest market, so it needed the strictest filter. In the realised partition-B sweep, keeping HC and OU fixed at \(0.023\) and \(0.03\), moving the 1X2 threshold from \(0.00\) to \(0.03\) improved unit-stake RoI from \(18.6\%\) to \(35.2\%\), and at \(0.035\) the 1X2 book was filtered out completely, leaving only HC and OU. HC was much less sensitive in the \(0.02\) to \(0.03\) range, so \(0.023\) was kept as a middle ground. OU improved steadily from \(0.02\) to \(0.03\), so \(0.03\) was retained as the cleaner setting.
+These thresholds are now tuned on partition A only, not on partition B. I ran a small grid on A alone:
+\[
+\text{1X2} \in \{0.02, 0.025, 0.03, 0.035, 0.04\},
+\]
+\[
+\text{HC} \in \{0.018, 0.02, 0.023, 0.025, 0.028, 0.03\},
+\]
+\[
+\text{OU} \in \{0.02, 0.025, 0.03, 0.035\}.
+\]
+Within that grid, \((0.03,\,0.023,\,0.035)\) was chosen as the final tuple. It is still selected on A only, but unlike the stricter \(0.035\) cut on 1X2, it keeps a non-zero 1X2 book alive. That is useful for portfolio construction: keeping some exposure across different market types helps avoid concentrating the whole book in only HC and OU, to reduce portfolio risk according to the portfolio optimization principles.
 
 On clean partition B, this produces:
 \begin{itemize}
-    \item \(866\) selections in total;
+    \item \(850\) selections in total;
     \item \(261\) from 1X2;
     \item \(456\) from HC;
-    \item \(149\) from OU.
+    \item \(133\) from OU.
 \end{itemize}
 
 I am not betting every positive-EV line. I am only betting selections that clear the market-specific thresholds after calibration and tail shrink. The reason is practical: the smallest positive-EV bets are exactly where the model tends to be most optimistic, so it is better to give up some volume and keep the average edge cleaner.
@@ -388,7 +396,7 @@ I am not betting every positive-EV line. I am only betting selections that clear
 
 \noindent \textbf{Question 3. ``Define Stake as the amount that you bet, calculate PnL as the Profit and Loss and RoI as PnL/Stake for each selection. (i) Calculate the overall PnL and RoI. (ii) Plot the cumulative PnL and EV as a function of time in days. (iii) Plot the 2-week rolling PnL and EV average.''}
 
-\noindent \textbf{Answer.} For stake sizing, I use Kelly rather than flat staking. The reason is that Kelly links bet size to estimated edge and current bankroll. More importantly, it comes from maximising expected log wealth rather than raw expected cash profit. That matters because log wealth strongly penalises paths that drive the bankroll close to zero.
+\noindent \textbf{Answer.} For stake sizing, I use Kelly rather than flat staking. Kelly links bet size to estimated edge and current bankroll. More importantly, it comes from maximising expected log wealth rather than raw expected cash profit. That matters because log wealth strongly penalises paths that drive the bankroll close to zero.
 
 For one bet with win probability \(p\), decimal odds \(o\), and stake fraction \(f\), the one-step expected log return is
 \[
@@ -416,6 +424,8 @@ The bankroll rules in this section are fixed as:
     \item bankroll cannot go below zero;
     \item once bankroll hits zero, betting stops.
 \end{itemize}
+
+The stopping rule is bankruptcy, not ``EV hits zero''. EV can move around from bet to bet, but the simulated path only ends when the bankroll itself reaches zero.
 
 So for one candidate bet at time \(t\), the executable stake is
 \[
@@ -452,25 +462,33 @@ Under these exact bankroll constraints on partition B, the results are:
 \toprule
 Strategy & Total PnL & Ending Bankroll & Turnover RoI & Max Drawdown & Sharpe-style Proxy \\
 \midrule
-100\% Kelly & \(+1{,}299{,}402.01\) & \(1{,}299{,}502.01\) & \(34.39\%\) & \(-88.35\%\) & \(5.20\) \\
-50\% Kelly & \(+1{,}249{,}139.57\) & \(1{,}249{,}239.57\) & \(36.32\%\) & \(-44.17\%\) & \(5.32\) \\
-25\% Kelly & \(+1{,}073{,}074.66\) & \(1{,}073{,}174.66\) & \(37.77\%\) & \(-22.09\%\) & \(7.82\) \\
+100\% Kelly & \(+1{,}299{,}009.53\) & \(1{,}299{,}109.53\) & \(35.03\%\) & \(-88.35\%\) & \(5.19\) \\
+50\% Kelly & \(+1{,}246{,}238.09\) & \(1{,}246{,}338.09\) & \(36.91\%\) & \(-44.17\%\) & \(5.32\) \\
+25\% Kelly & \(+1{,}062{,}903.30\) & \(1{,}063{,}003.30\) & \(38.11\%\) & \(-22.09\%\) & \(7.81\) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-None of the three Kelly paths went bust in this realised sample, but full Kelly has extremely severe drawdowns. The most balanced line here is \(25\%\) Kelly: lower terminal PnL than full Kelly, but the highest turnover RoI, the mildest drawdown, and the best simple Sharpe-style proxy based on daily bankroll returns. That is why I would prefer \(25\%\) Kelly in practice. The point is not to maximise the paper terminal value at all costs. The point is to maximise risk-adjusted return.
+None of the three Kelly paths went bust in this realised sample, but every path would have stopped immediately if bankroll had hit zero. Full Kelly still has extremely severe drawdowns. The most balanced line here is \(25\%\) Kelly: lower terminal PnL than full Kelly, but the highest turnover RoI, by far the mildest drawdown, and the best simple Sharpe-style proxy based on daily bankroll returns. That is why I would prefer \(25\%\) Kelly in practice. The point is not to maximise the paper terminal value at all costs. The point is to maximise risk-adjusted return.
+
+For the time-series plots below, I use the \(25\%\) Kelly path because it is the practical choice from the table above. The cumulative EV line is the running sum of expected net PnL, where each bet contributes stake \(\times\) edge minus fee. The rolling plot then takes the daily realised and expected PnL series and averages them over a moving 14-day window.
 
 \begin{figure}[htbp]
 \centering
-\includegraphics[width=0.92\textwidth]{../outputs/kelly_backtest/cumulative_net_pnl.png}
-\caption{Cumulative net PnL for 100\%, 50\%, and 25\% Kelly under the bankroll, fee, and stake-cap constraints.}
+\includegraphics[width=0.84\textwidth]{../outputs/kelly_backtest/kelly_25_cumulative_pnl_ev.png}
+\caption{25\% Kelly cumulative realised PnL and cumulative EV by day. }
 \end{figure}
 
 \begin{figure}[htbp]
 \centering
-\includegraphics[width=0.92\textwidth]{../outputs/kelly_backtest/bankroll_paths_log.png}
-\caption{Kelly bankroll paths on a log scale. This view is more readable because the three strategies end at very different bankroll levels.}
+\includegraphics[width=0.84\textwidth]{../outputs/kelly_backtest/kelly_25_rolling_pnl_ev.png}
+\caption{25\% Kelly 14-day rolling realised PnL average and 14-day rolling EV average. }
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.84\textwidth]{../outputs/kelly_backtest/bankroll_paths_log.png}
+\caption{Kelly bankroll paths on a log scale for 100\%, 50\%, and 25\% Kelly. This keeps the cross-strategy comparison visible alongside the 25\% Kelly time-series plots.}
 \end{figure}
 
 \bigskip
@@ -481,23 +499,29 @@ None of the three Kelly paths went bust in this realised sample, but full Kelly 
 
 To test this, I run a Monte Carlo simulation on the selected bets. For each selected bet \(i\), I treat the calibrated tail probability \(p_i\) as the Bernoulli win probability, simulate the bet outcome many times, and sum the simulated PnL across the whole portfolio. Repeating that gives a distribution for total PnL under the model's own assumptions.
 
+I first simulate it and plot the empirical distribution. It looks roughly normal mainly because there are many bets, and total PnL is the sum of many small independent or near-independent random payoffs. So the normal shape is an outcome of the central limit effect.
+
 If the model's EV were perfectly calibrated, the realised PnL would sit in a fairly ordinary part of that simulated distribution. If the realised PnL kept landing near the extreme lower tail, that would mean the model is overstating its edge.
 
 The probability model behind the Kelly sizing was checked earlier with Monte Carlo on the selected partition-B bets:
 \begin{itemize}
-    \item actual total PnL \(=+305.09\);
-    \item Monte Carlo median PnL \(=+249.61\);
-    \item Monte Carlo 5th to 95th percentile range \(=[+181.73,\; +319.25]\);
+    \item actual total PnL \(=+303.49\);
+    \item Monte Carlo median PnL \(=+249.57\);
+    \item Monte Carlo 5th to 95th percentile range \(=[+181.92,\; +319.40]\);
     \item actual percentile \(=90\)th.
 \end{itemize}
 
-So the realised outcome is better than the model median in this sample. That is encouraging, but it still does not prove that the EV is accurate. The Monte Carlo check is only an internal consistency test. It asks: if the model probabilities were correct, would the realised PnL look plausible? It does not establish that the probabilities are stable out of sample.
+The realised outcome sits high in the model distribution, but that should be read carefully. A \(90\)th-percentile outcome does \emph{not} automatically mean the model understated its true edge. The safer interpretation is that this realised path was favourable relative to the model median. In other words, the backtest did well, but part of that success is still ordinary upper-tail luck. To claim that the model is systematically conservative, I would need to see the same pattern repeated across multiple independent periods, not just one partition-B run.
 
-To make the stress-test idea more concrete, I also plot one pessimistic scenario. In that scenario, I cut the model edge by shrinking each selected probability about \(28\%\) toward the no-vig market probability:
+What is encouraging is more specific than that. The realised PnL is high, but it is not absurdly far outside the model range, and the selected book is concentrated in the cleaner HC and OU bets after calibration and tail shrink. So the simulation does not suggest a wildly misspecified model. But from a risk point of view, the main lesson is still about the downside: how bad can the portfolio look if the edge is weaker than the fitted model says?
+
+That is why I treat Monte Carlo here mainly as a risk tool, not a victory lap. The useful outputs are the left tail, the stress scenarios, and how quickly the edge shrinks once the probabilities are perturbed. The question is not ``did this run make money?'' The question is ``how fragile is the portfolio if the model is even slightly wrong?''
+
+To make the stress-test idea more concrete, I also plot one pessimistic scenario. In that scenario, I cut the model edge by shrinking each selected probability about \(27\%\) toward the no-vig market probability:
 \[
-p_{\text{stress}} = p_{\text{market}} + 0.72\left(p_{\text{tail}} - p_{\text{market}}\right).
+p_{\text{stress}} = p_{\text{market}} + 0.73\left(p_{\text{tail}} - p_{\text{market}}\right).
 \]
-Under that stressed probability set, the Monte Carlo median falls to \(+179.16\), which sits around the 5th percentile of the original model distribution. This is a useful visual reminder that the current edge can look much less comfortable once the distribution is perturbed even mildly.
+Under that stressed probability set, the Monte Carlo median falls to \(+182.43\), which sits around the 5th percentile of the original model distribution. This is the key risk message: a fairly modest haircut to the probabilities already moves the portfolio from ``comfortably above the model median'' to something that looks like a lower-tail outcome under the original assumptions. So even though the realised path was strong, the edge is still sensitive.
 
 The more serious failure mode is distribution shift. If the home and away means drift, if the variance layer becomes too narrow, if the tails are mis-specified, or if the bookmaker market adapts, then the realised win rate can fall below the model probability. In that case Kelly can lose money fast because the stake is a direct function of estimated edge.
 
@@ -511,14 +535,14 @@ That is why stress testing matters. Reasonable stress tests here are:
 \end{itemize}
 If the strategy only works under the exact fitted distribution, then the edge is too fragile.
 
-There is also a market-microstructure risk that the backtest does not solve: if a bookmaker detects an advantage player, it can lower the bet cap, delay acceptance, or restrict the account entirely. In that case the theoretical Kelly fraction is no longer deployable, so realised growth can be much lower than the paper path even if the raw EV estimate is correct.
+There is also a market risk: if a bookmaker detects an advantage player, it can lower the bet cap, delay acceptance, or restrict the account entirely. In that case the theoretical Kelly fraction is no longer deployable, so realised growth can be much lower than the paper path even if the raw EV estimate is correct.
 
-This is also why I prefer showing \(25\%\) and \(50\%\) Kelly alongside full Kelly rather than trusting full Kelly blindly. If the EV estimate is even slightly too high, full Kelly overreacts immediately. Fractional Kelly gives more room for model error.
+This is another reason that I prefer showing \(25\%\) and \(50\%\) Kelly alongside full Kelly rather than trusting full Kelly blindly. If the EV estimate is even slightly too high, full Kelly overreacts immediately. Fractional Kelly gives more room for model error.
 
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=0.82\textwidth]{../outputs/kelly_backtest/selection_edge_monte_carlo.png}
-\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets, with one stressed scenario overlaid. The stressed line uses an approximately 28\% shrink toward market-implied probabilities so that the stressed median lands near the 5th percentile of the original model distribution.}
+\caption{Monte Carlo distribution of unit-stake total PnL for the selected partition-B bets, with one stressed scenario overlaid. The stressed line uses an approximately 27\% shrink toward market-implied probabilities so that the stressed median lands near the 5th percentile of the original model distribution.}
 \end{figure}
 
 \end{document}

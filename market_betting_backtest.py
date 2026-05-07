@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 
 STAKE = 1.0
 DEFAULT_EV_THRESHOLD = 0.03
-DEFAULT_MARKET_THRESHOLDS = {"1X2": 0.030, "HC": 0.023, "OU": 0.030}
+DEFAULT_MARKET_THRESHOLDS = {"1X2": 0.030, "HC": 0.023, "OU": 0.035}
 DEFAULT_MONTE_CARLO_RUNS = 10_000
 CALIBRATION_MIN_SAMPLES = 120
 CALIBRATION_SHRINKAGE = 500.0
@@ -30,7 +30,7 @@ NORMAL_Q10_Q90_SPAN = 2.5631031310892007
 
 @dataclass
 class MarketBacktestArtifacts:
-    """Container for the main intermediate and final tables from the market backtest."""
+    """Store the main tables from one market backtest run."""
 
     partition_a_bets: pd.DataFrame
     partition_b_bets: pd.DataFrame
@@ -42,12 +42,12 @@ class MarketBacktestArtifacts:
 
 
 def print_heading(title: str) -> None:
-    """Print a section header for market backtest console output."""
+    """Print a small console section header."""
     print(f"\n=== {title} ===")
 
 
 def load_prediction_and_market_tables(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load Q1 match predictions, quoted market prices, and realised match results."""
+    """Load Q1 predictions, market prices, and realised results."""
     latest_prediction_path = data_dir / "q1_betting_match_predictions.latest.csv"
     candidate_paths = [
         latest_prediction_path,
@@ -67,7 +67,7 @@ def load_prediction_and_market_tables(data_dir: Path) -> tuple[pd.DataFrame, pd.
 
 
 def attach_q1_distribution_columns(predicted_matches: pd.DataFrame) -> pd.DataFrame:
-    """Rename Q1 output columns into clearer distribution inputs for the betting layer."""
+    """Rename Q1 columns so the betting code reads more clearly."""
     prepared = predicted_matches.copy()
     prepared["predicted_home_corner_mean"] = prepared["pred_home_corners"]
     prepared["predicted_away_corner_mean"] = prepared["pred_away_corners"]
@@ -89,7 +89,7 @@ def attach_q1_distribution_columns(predicted_matches: pd.DataFrame) -> pd.DataFr
 
 
 def quantile_tail_distance(prediction_row: pd.Series, market_type: str, market_line: float, side_name: str) -> float:
-    """Measure how far a candidate side sits outside Q1's empirical q10-q90 envelope."""
+    """Measure how far a quoted side sits outside Q1's q10-q90 range."""
     required_cols = {
         "pred_home_q10",
         "pred_home_q50",
@@ -176,7 +176,7 @@ def estimate_home_away_corner_correlation(calibration_matches: pd.DataFrame) -> 
 
 
 def negative_binomial_parameters_from_moments(predicted_mean: float, predicted_variance: float) -> tuple[float, float]:
-    """Convert a mean/variance pair into scipy's negative-binomial parameterization."""
+    """Turn a mean and variance into negative-binomial parameters."""
     stable_mean = float(np.maximum(predicted_mean, 1e-6))
     stable_variance = float(np.maximum(predicted_variance, stable_mean + 1e-6))
     success_prob = stable_mean / stable_variance
@@ -191,7 +191,7 @@ def combined_total_moments(
     predicted_away_variance: float,
     shared_rho: float,
 ) -> tuple[float, float]:
-    """Combine home and away predictions into total-corners moments."""
+    """Combine home and away into total-corner mean and variance."""
     predicted_total = float(np.maximum(predicted_home_corners + predicted_away_corners, 1e-6))
     covariance_adjustment = 2.0 * shared_rho * np.sqrt(
         np.maximum(predicted_home_variance, 1e-6) * np.maximum(predicted_away_variance, 1e-6)
@@ -209,7 +209,7 @@ def combined_diff_moments(
     predicted_away_variance: float,
     shared_rho: float,
 ) -> tuple[float, float]:
-    """Combine home and away predictions into corner-difference moments."""
+    """Combine home and away into corner-difference mean and variance."""
     predicted_diff = float(predicted_home_corners - predicted_away_corners)
     covariance_adjustment = 2.0 * shared_rho * np.sqrt(
         np.maximum(predicted_home_variance, 1e-6) * np.maximum(predicted_away_variance, 1e-6)
@@ -228,7 +228,7 @@ def probability_total_over(
     quoted_line: float,
     shared_rho: float,
 ) -> float:
-    """Compute `P(total corners > line)` from the Q1 moments."""
+    """Compute the model probability that total corners beat the OU line."""
     predicted_total, predicted_total_variance = combined_total_moments(
         predicted_home_corners,
         predicted_home_variance,
@@ -252,7 +252,7 @@ def probability_diff_outcome(
     outcome_side: str,
     shared_rho: float,
 ) -> float:
-    """Compute handicap or 1X2 outcome probabilities from the corner-difference moments."""
+    """Compute home, draw, or away probabilities from the corner-difference moments."""
     predicted_diff, predicted_diff_variance = combined_diff_moments(
         predicted_home_corners,
         predicted_home_variance,
@@ -287,12 +287,12 @@ def probability_diff_outcome(
 
 
 def quoted_market_line(price_row: pd.Series) -> float:
-    """Read the OU or handicap line from the market row."""
+    """Read the OU or handicap line from one price row."""
     return float(price_row["od"]) if price_row["odds_type"] in {"OU", "HC"} else 0.0
 
 
 def model_market_outcome_probabilities(prediction_row: pd.Series, price_row: pd.Series, shared_rho: float) -> dict[str, float]:
-    """Turn one Q1 prediction row into model probabilities for one quoted market."""
+    """Turn one Q1 match prediction into probabilities for one quoted market."""
     predicted_home_corners = float(prediction_row["predicted_home_corner_mean"])
     predicted_away_corners = float(prediction_row["predicted_away_corner_mean"])
     predicted_home_variance = float(prediction_row["predicted_home_corner_variance"])
@@ -379,7 +379,7 @@ def build_candidate_bet_rows(
     shared_rho: float,
     partition_label: str,
 ) -> pd.DataFrame:
-    """Create one row per candidate betting side for one partition."""
+    """Build one candidate row for each bettable market side."""
     prediction_lookup = prediction_rows.set_index("match_id").to_dict("index")
     relevant_prices = market_prices[market_prices["match_id"].isin(prediction_rows["match_id"])].copy()
     candidate_rows: list[dict[str, object]] = []
@@ -425,7 +425,7 @@ def build_candidate_bet_rows(
 
 
 def attach_observed_outcomes(candidate_bets: pd.DataFrame, observed_results: pd.DataFrame) -> pd.DataFrame:
-    """Attach realised win/loss indicators to each candidate side."""
+    """Attach the realised win/loss label to each candidate side."""
     merged = candidate_bets.merge(observed_results[["match_id", "home_corners", "away_corners"]], on="match_id", how="left")
     actual_total = merged["home_corners"] + merged["away_corners"]
     actual_diff = merged["home_corners"] - merged["away_corners"]
@@ -460,21 +460,21 @@ def attach_observed_outcomes(candidate_bets: pd.DataFrame, observed_results: pd.
 
 
 def brier_score(actual: pd.Series | np.ndarray, predicted_probability: pd.Series | np.ndarray) -> float:
-    """Compute mean Brier score."""
+    """Compute the Brier score."""
     actual_array = np.asarray(actual, dtype=float)
     probability_array = np.asarray(predicted_probability, dtype=float)
     return float(np.mean((actual_array - probability_array) ** 2))
 
 
 def log_loss_score(actual: pd.Series | np.ndarray, predicted_probability: pd.Series | np.ndarray) -> float:
-    """Compute binary log loss with safe clipping."""
+    """Compute binary log loss with clipping for safety."""
     actual_array = np.asarray(actual, dtype=float)
     probability_array = np.clip(np.asarray(predicted_probability, dtype=float), 1e-6, 1 - 1e-6)
     return float(-np.mean(actual_array * np.log(probability_array) + (1 - actual_array) * np.log(1 - probability_array)))
 
 
 def fit_side_probability_calibrators(training_bets: pd.DataFrame) -> tuple[dict[str, dict[str, object]], pd.DataFrame]:
-    """Fit per-side isotonic probability calibrators on partition A."""
+    """Fit one probability calibrator per market side on partition A."""
     calibrators: dict[str, dict[str, object]] = {}
     report_rows: list[dict[str, object]] = []
     training_rows = training_bets.dropna(subset=["p_raw", "won"]).copy()
@@ -519,7 +519,7 @@ def fit_side_probability_calibrators(training_bets: pd.DataFrame) -> tuple[dict[
 
 
 def apply_side_probability_calibration(candidate_bets: pd.DataFrame, calibrators: dict[str, dict[str, object]]) -> pd.DataFrame:
-    """Apply the per-side isotonic calibration and renormalize within each market."""
+    """Apply the fitted calibrators and renormalize each market."""
     calibrated = candidate_bets.copy()
     calibrated["calibration_key"] = calibrated["odds_type"] + "|" + calibrated["side"]
     pre_normalized_probabilities: list[float] = []
@@ -545,7 +545,7 @@ def apply_side_probability_calibration(candidate_bets: pd.DataFrame, calibrators
 
 
 def attach_market_no_vig_probabilities(candidate_bets: pd.DataFrame) -> pd.DataFrame:
-    """Convert decimal odds inside each market into no-vig reference probabilities."""
+    """Convert quoted odds into no-vig market probabilities."""
     with_market_probs = candidate_bets.copy()
     with_market_probs["inv_odds"] = np.where(with_market_probs["bettable"], 1.0 / with_market_probs["odds"], np.nan)
     probability_sum = with_market_probs.groupby("group_id")["inv_odds"].transform("sum")
@@ -557,7 +557,7 @@ def resolve_market_thresholds(
     ev_threshold: float | None = None,
     market_thresholds: dict[str, float] | None = None,
 ) -> dict[str, float]:
-    """Resolve the effective per-market EV thresholds for bet selection."""
+    """Resolve the EV threshold used for each market."""
     if market_thresholds is not None:
         return {market_name: float(value) for market_name, value in market_thresholds.items()}
     if ev_threshold is None:
@@ -566,12 +566,12 @@ def resolve_market_thresholds(
 
 
 def threshold_column_name(probability_column: str) -> str:
-    """Convert an EV column name into the corresponding threshold column name."""
+    """Map an EV column name to its threshold column name."""
     return "threshold_" + probability_column.replace("ev_", "")
 
 
 def attach_market_thresholds(candidate_bets: pd.DataFrame, market_thresholds: dict[str, float]) -> pd.DataFrame:
-    """Attach market-specific threshold columns to one bet table."""
+    """Attach the right EV threshold to each candidate bet row."""
     with_thresholds = candidate_bets.copy()
     with_thresholds["threshold_ev"] = with_thresholds["odds_type"].map(market_thresholds).fillna(DEFAULT_EV_THRESHOLD)
     for probability_column in ["ev_raw", "ev", "ev_tail"]:
@@ -584,7 +584,7 @@ def select_bets_with_market_thresholds(
     candidate_bets: pd.DataFrame,
     ev_column: str,
 ) -> pd.DataFrame:
-    """Select bettable sides whose EV clears the threshold assigned to their market."""
+    """Keep only sides that are bettable and clear the EV cutoff."""
     threshold_col = threshold_column_name(ev_column)
     selected = candidate_bets[
         candidate_bets["bettable"] & candidate_bets[ev_column].notna() & (candidate_bets[ev_column] > candidate_bets[threshold_col])
@@ -597,7 +597,7 @@ def apply_tail_probability_shrink(
     lambda_by_market: dict[str, float],
     tail_scale: float,
 ) -> pd.DataFrame:
-    """Shrink only the positive-EV tail back toward no-vig market probabilities."""
+    """Pull the most aggressive positive-EV tails back toward market odds."""
     shrunk = candidate_bets.copy()
     shrunk["p_tail"] = shrunk["p_model"]
     shrunk["ev_tail"] = shrunk["ev"]
@@ -625,7 +625,7 @@ def apply_tail_probability_shrink(
 
 
 def fit_tail_lambda(training_bets: pd.DataFrame, odds_type: str, market_threshold: float) -> float:
-    """Choose how aggressively one market's high-EV tail should revert to market probabilities."""
+    """Choose how hard one market should shrink its high-EV tail."""
     subset = training_bets[(training_bets["bettable"]) & (training_bets["odds_type"] == odds_type) & (training_bets["ev"] > market_threshold)].copy()
     if subset.empty:
         return 0.0
@@ -649,7 +649,7 @@ def fit_tail_lambda(training_bets: pd.DataFrame, odds_type: str, market_threshol
 
 
 def realised_roi(selected_bets: pd.DataFrame) -> float:
-    """Compute mean per-bet realised profit."""
+    """Compute realised profit per bet."""
     if selected_bets.empty:
         return np.nan
     profit = np.where(selected_bets["won"] == 1, STAKE * (selected_bets["odds"] - 1.0), -STAKE)
@@ -661,7 +661,7 @@ def choose_tail_scale(
     lambda_by_market: dict[str, float],
     market_thresholds: dict[str, float],
 ) -> tuple[float, pd.DataFrame]:
-    """Choose the tail-shrink scale that best aligns A-side mean EV with realised ROI."""
+    """Choose the tail-shrink scale that best matches EV to realised ROI on A."""
     diagnostics: list[dict[str, float | int]] = []
     best_scale = 0.0
     best_gap = np.inf
@@ -682,7 +682,7 @@ def choose_tail_scale(
 
 
 def summarize_market_calibration(raw_bets: pd.DataFrame, calibrated_bets: pd.DataFrame, partition_label: str) -> pd.DataFrame:
-    """Summarize Brier, log loss, and average EV by market."""
+    """Summarize calibration quality by market."""
     rows: list[dict[str, object]] = []
     for odds_type in sorted(calibrated_bets["odds_type"].unique()):
         raw_market = raw_bets[raw_bets["odds_type"] == odds_type]
@@ -706,7 +706,7 @@ def summarize_market_calibration(raw_bets: pd.DataFrame, calibrated_bets: pd.Dat
 
 
 def evaluate_selected_bets(selected_bets: pd.DataFrame, monte_carlo_runs: int) -> dict[str, float]:
-    """Compute realised PnL, ROI, and Monte Carlo diagnostics for selected bets."""
+    """Compute realised PnL, ROI, and Monte Carlo checks for the selected bets."""
     selected = selected_bets.copy()
     selected["pnl"] = np.where(selected["won"] == 1, STAKE * (selected["odds"] - 1), -STAKE)
     total_pnl = float(selected["pnl"].sum())
@@ -738,7 +738,7 @@ def evaluate_selected_bets(selected_bets: pd.DataFrame, monte_carlo_runs: int) -
 
 
 def plot_cumulative_pnl(selected_bets: pd.DataFrame, output_dir: Path) -> None:
-    """Plot cumulative realised vs expected PnL."""
+    """Plot cumulative realised PnL against cumulative expected PnL."""
     fig, axis = plt.subplots(figsize=(11, 4))
     axis.plot(selected_bets["date_time"], selected_bets["cum_pnl"], label="Realised PnL", linewidth=1.5)
     axis.plot(
@@ -833,7 +833,7 @@ def save_backtest_outputs(
     tail_scale_report: pd.DataFrame,
     run_summary: pd.DataFrame,
 ) -> None:
-    """Persist backtest tables for one run into the chosen output directory."""
+    """Write the backtest tables for one run."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def safe_write_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -861,7 +861,7 @@ def run_market_betting_backtest(
     evaluation_scope: str = "B",
     make_plots: bool = True,
 ) -> MarketBacktestArtifacts:
-    """Run the full market-probability, calibration, and backtest pipeline."""
+    """Run the full market backtest from Q1 predictions to selected bets."""
     data_path = Path(data_dir)
     result_path = Path(output_dir) if output_dir is not None else data_path
     result_path.mkdir(parents=True, exist_ok=True)
@@ -1018,7 +1018,7 @@ def run_market_betting_backtest(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the standalone market backtest runner."""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Run the market calibration and betting backtest pipeline.")
     parser.add_argument("--data-dir", default=".", help="Directory containing Q1 outputs and market price files.")
     parser.add_argument(

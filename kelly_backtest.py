@@ -30,15 +30,131 @@ KELLY_STRATEGIES = {
 
 @dataclass
 class KellyBacktestArtifacts:
-    """Container for the selected bets, realised paths, and summary tables."""
+    """Store the selected bets, path tables, and summary table."""
 
     selected_bets: pd.DataFrame
     strategy_paths: dict[str, pd.DataFrame]
     strategy_summary: pd.DataFrame
 
 
+def attach_expected_pnl(
+    strategy_path: pd.DataFrame,
+    selected_bets: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach the per-bet EV so realised and expected PnL can be plotted together."""
+    join_keys = ["match_id", "date_time", "odds_type", "side", "odds"]
+    expected = selected_bets[join_keys + ["ev_tail"]].copy()
+    enriched = strategy_path.merge(expected, on=join_keys, how="left", validate="one_to_one")
+    enriched["expected_net_pnl"] = enriched["stake"] * enriched["ev_tail"] - enriched["fee"]
+    return enriched
+
+
+def build_daily_pnl_ev_table(strategy_path_with_ev: pd.DataFrame) -> pd.DataFrame:
+    """Collapse one Kelly path into daily realised and expected PnL series."""
+    daily = (
+        strategy_path_with_ev.assign(day=strategy_path_with_ev["date_time"].dt.floor("D"))
+        .groupby("day", as_index=False)
+        .agg(
+            realized_pnl=("net_pnl", "sum"),
+            expected_pnl=("expected_net_pnl", "sum"),
+        )
+    )
+    daily["cumulative_realized_pnl"] = daily["realized_pnl"].cumsum()
+    daily["cumulative_expected_pnl"] = daily["expected_pnl"].cumsum()
+    daily = daily.set_index("day")
+    daily["rolling_14d_realized_avg"] = daily["realized_pnl"].rolling("14D").mean()
+    daily["rolling_14d_expected_avg"] = daily["expected_pnl"].rolling("14D").mean()
+    return daily.reset_index()
+
+
+def simulate_unit_stake_total_pnl(
+    win_probabilities: np.ndarray,
+    decimal_odds: np.ndarray,
+    runs: int,
+    seed: int,
+) -> np.ndarray:
+    """Simulate total PnL under flat unit stakes for one set of win probabilities."""
+    rng = np.random.default_rng(seed)
+    wins = rng.binomial(1, np.clip(win_probabilities, 1e-6, 1 - 1e-6), size=(runs, len(win_probabilities)))
+    win_pnl = decimal_odds - 1.0
+    lose_pnl = -1.0
+    return np.where(wins == 1, win_pnl, lose_pnl).sum(axis=1)
+
+
+def choose_stress_shrink(
+    selected_bets: pd.DataFrame,
+    base_samples: np.ndarray,
+    target_percentile: float = 5.0,
+) -> float:
+    """Choose how hard to shrink model probabilities toward market probabilities for the stress test."""
+    base_probabilities = selected_bets["p_tail"].to_numpy(dtype=float)
+    market_probabilities = selected_bets["p_market"].to_numpy(dtype=float)
+    decimal_odds = selected_bets["odds"].to_numpy(dtype=float)
+    grid = np.linspace(0.40, 1.00, 61)
+    best_alpha = 1.0
+    best_gap = float("inf")
+    for alpha in grid:
+        stress_probabilities = np.clip(
+            market_probabilities + alpha * (base_probabilities - market_probabilities),
+            1e-6,
+            1 - 1e-6,
+        )
+        expected_total_pnl = float(np.sum(stress_probabilities * (decimal_odds - 1.0) - (1.0 - stress_probabilities)))
+        percentile = 100.0 * float(np.mean(base_samples <= expected_total_pnl))
+        gap = abs(percentile - target_percentile)
+        if gap < best_gap:
+            best_gap = gap
+            best_alpha = float(alpha)
+    return best_alpha
+
+
+def build_selection_edge_stress_summary(
+    selected_bets: pd.DataFrame,
+    runs: int = 10_000,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Build the base and stressed Monte Carlo summaries for the selected flat-stake edge."""
+    base_probabilities = selected_bets["p_tail"].to_numpy(dtype=float)
+    market_probabilities = selected_bets["p_market"].to_numpy(dtype=float)
+    decimal_odds = selected_bets["odds"].to_numpy(dtype=float)
+    actual_total_pnl = float(np.where(selected_bets["won"].to_numpy(dtype=float) == 1.0, decimal_odds - 1.0, -1.0).sum())
+
+    base_samples = simulate_unit_stake_total_pnl(base_probabilities, decimal_odds, runs, seed=7)
+    stress_alpha = choose_stress_shrink(selected_bets, base_samples, target_percentile=5.0)
+    stress_probabilities = np.clip(
+        market_probabilities + stress_alpha * (base_probabilities - market_probabilities),
+        1e-6,
+        1 - 1e-6,
+    )
+    stress_samples = simulate_unit_stake_total_pnl(stress_probabilities, decimal_odds, runs, seed=11)
+
+    summary = pd.DataFrame(
+        [
+            {
+                "actual_total_pnl": actual_total_pnl,
+                "base_median_pnl": float(np.median(base_samples)),
+                "base_q05_pnl": float(np.quantile(base_samples, 0.05)),
+                "base_q95_pnl": float(np.quantile(base_samples, 0.95)),
+                "stress_definition": f"p_stress = p_market + {stress_alpha:.2f} * (p_tail - p_market)",
+                "stress_median_pnl": float(np.median(stress_samples)),
+                "stress_q05_pnl": float(np.quantile(stress_samples, 0.05)),
+                "stress_q95_pnl": float(np.quantile(stress_samples, 0.95)),
+                "stress_median_percentile_in_base_mc": round(100.0 * float(np.mean(base_samples <= np.median(stress_samples))), 2),
+            }
+        ]
+    )
+    plot_payload = {
+        "base_samples": base_samples,
+        "stress_samples": stress_samples,
+        "actual_total_pnl": actual_total_pnl,
+        "base_median_pnl": float(np.median(base_samples)),
+        "stress_median_pnl": float(np.median(stress_samples)),
+        "stress_definition": summary.iloc[0]["stress_definition"],
+    }
+    return summary, plot_payload
+
+
 def print_heading(title: str) -> None:
-    """Print a compact section header for the Kelly backtest runner."""
+    """Print a small console section header."""
     print(f"\n=== {title} ===")
 
 
@@ -47,7 +163,7 @@ def load_selected_bets(
     evaluation_scope: str,
     market_thresholds: dict[str, float],
 ) -> pd.DataFrame:
-    """Rebuild the currently selected bet set from Q1 predictions and market prices."""
+    """Rebuild the final selected-bet table from the current Q1 outputs."""
     predicted_matches, market_prices, observed_results = market_backtest.load_prediction_and_market_tables(data_dir)
     predicted_matches = market_backtest.attach_q1_distribution_columns(predicted_matches)
     partition_a_predictions = predicted_matches[predicted_matches["partition"] == "A"].copy()
@@ -99,7 +215,7 @@ def load_selected_bets(
 
 
 def full_kelly_fraction(win_probability: np.ndarray, decimal_odds: np.ndarray) -> np.ndarray:
-    """Convert model win probabilities into full Kelly fractions for decimal odds."""
+    """Convert win probabilities into full Kelly fractions."""
     net_odds = np.maximum(decimal_odds - 1.0, 1e-12)
     raw_fraction = (win_probability * decimal_odds - 1.0) / net_odds
     return np.clip(raw_fraction, 0.0, 1.0)
@@ -113,7 +229,7 @@ def allocate_group_stakes(
     min_fee: float,
     max_bet: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Turn Kelly fractions into executable stake sizes under fee floors and bet caps."""
+    """Turn Kelly fractions into stake sizes after fees and caps."""
     target_fraction = np.clip(full_kelly * fraction_scale, 0.0, 1.0)
     raw_stakes = bankroll * target_fraction
     stakes = np.minimum(raw_stakes, max_bet)
@@ -138,7 +254,7 @@ def simulate_kelly_path(
     min_fee: float,
     max_bet: float,
 ) -> tuple[pd.DataFrame, dict[str, float | int | str | bool]]:
-    """Replay one realised Kelly path with fee floors, bet caps, and bust-at-zero logic."""
+    """Replay one realised Kelly bankroll path and stop as soon as bankroll hits zero."""
     bets = selected_bets.sort_values("date_time").reset_index(drop=True).copy()
     bankroll = float(initial_bankroll)
     peak_bankroll = bankroll
@@ -236,7 +352,7 @@ def simulate_kelly_path(
 
 
 def daily_return_sharpe_proxy(strategy_path: pd.DataFrame) -> float:
-    """Estimate a simple Sharpe-style ratio from daily bankroll returns."""
+    """Estimate a simple Sharpe-like ratio from daily bankroll returns."""
     if strategy_path.empty:
         return np.nan
     daily = (
@@ -254,14 +370,15 @@ def daily_return_sharpe_proxy(strategy_path: pd.DataFrame) -> float:
 
 
 def plot_bankroll_paths(strategy_paths: dict[str, pd.DataFrame], output_dir: Path, initial_bankroll: float) -> None:
-    """Save linear, log-scale, and cumulative-PnL bankroll charts for Kelly strategies."""
+    """Save the Kelly bankroll charts."""
     colors = {"kelly_100": "#c0392b", "kelly_50": "#e67e22", "kelly_25": "#2980b9"}
     labels = {"kelly_100": "100% Kelly", "kelly_50": "50% Kelly", "kelly_25": "25% Kelly"}
 
     fig, axis = plt.subplots(figsize=(12, 5))
     for name, frame in strategy_paths.items():
         axis.plot(frame["date_time"], frame["bankroll_after"], color=colors[name], linewidth=1.7, label=labels[name])
-    axis.set_title("Kelly bankroll path")
+    axis.axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
+    axis.set_title("Kelly bankroll path (stops at zero)")
     axis.set_xlabel("Date")
     axis.set_ylabel("Bankroll")
     axis.xaxis.set_major_locator(mdates.AutoDateLocator())
@@ -290,6 +407,7 @@ def plot_bankroll_paths(strategy_paths: dict[str, pd.DataFrame], output_dir: Pat
     fig, axis = plt.subplots(figsize=(12, 5))
     for name, frame in strategy_paths.items():
         axis.plot(frame["date_time"], frame["bankroll_after"] - initial_bankroll, color=colors[name], linewidth=1.7, label=labels[name])
+    axis.axhline(-initial_bankroll, color="black", linewidth=1.0, alpha=0.5)
     axis.set_title("Kelly cumulative net PnL")
     axis.set_xlabel("Date")
     axis.set_ylabel("Net PnL")
@@ -302,18 +420,114 @@ def plot_bankroll_paths(strategy_paths: dict[str, pd.DataFrame], output_dir: Pat
     plt.close(fig)
 
 
+def plot_q3_pnl_ev_views(kelly_25_daily: pd.DataFrame, output_dir: Path) -> None:
+    """Save the cumulative and 14-day rolling PnL/EV plots for the 25% Kelly path."""
+    fig, axis = plt.subplots(figsize=(12, 5))
+    axis.plot(
+        kelly_25_daily["day"],
+        kelly_25_daily["cumulative_realized_pnl"],
+        linewidth=2.0,
+        label="Cumulative realized PnL",
+    )
+    axis.plot(
+        kelly_25_daily["day"],
+        kelly_25_daily["cumulative_expected_pnl"],
+        linewidth=2.0,
+        label="Cumulative expected PnL (EV)",
+    )
+    axis.set_title("25% Kelly cumulative PnL and EV by day")
+    axis.set_xlabel("Date")
+    axis.set_ylabel("USD")
+    axis.xaxis.set_major_locator(mdates.AutoDateLocator())
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    axis.legend()
+    axis.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(output_dir / "kelly_25_cumulative_pnl_ev.png", dpi=160)
+    plt.close(fig)
+
+    fig, axis = plt.subplots(figsize=(12, 5))
+    axis.plot(
+        kelly_25_daily["day"],
+        kelly_25_daily["rolling_14d_realized_avg"],
+        linewidth=2.0,
+        label="14-day rolling realized PnL average",
+    )
+    axis.plot(
+        kelly_25_daily["day"],
+        kelly_25_daily["rolling_14d_expected_avg"],
+        linewidth=2.0,
+        label="14-day rolling EV average",
+    )
+    axis.set_title("25% Kelly 14-day rolling PnL and EV averages")
+    axis.set_xlabel("Date")
+    axis.set_ylabel("USD per day")
+    axis.xaxis.set_major_locator(mdates.AutoDateLocator())
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    axis.legend()
+    axis.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(output_dir / "kelly_25_rolling_pnl_ev.png", dpi=160)
+    plt.close(fig)
+
+
+def plot_selection_edge_monte_carlo(plot_payload: dict[str, object], output_dir: Path) -> None:
+    """Plot the base Monte Carlo edge distribution and one stressed scenario."""
+    fig, axis = plt.subplots(figsize=(9, 4))
+    axis.hist(
+        plot_payload["base_samples"],
+        bins=80,
+        density=True,
+        alpha=0.70,
+        color="steelblue",
+        label="Base MC distribution",
+    )
+    axis.axvline(
+        plot_payload["actual_total_pnl"],
+        color="red",
+        linewidth=2.0,
+        label=f"Actual PnL = {plot_payload['actual_total_pnl']:+.2f}",
+    )
+    axis.axvline(
+        plot_payload["base_median_pnl"],
+        color="orange",
+        linewidth=1.5,
+        linestyle="--",
+        label=f"Base MC median = {plot_payload['base_median_pnl']:+.2f}",
+    )
+    axis.axvline(
+        plot_payload["stress_median_pnl"],
+        color="purple",
+        linewidth=1.8,
+        linestyle="-.",
+        label=f"Stress median = {plot_payload['stress_median_pnl']:+.2f}",
+    )
+    axis.axvline(0.0, color="grey", linewidth=0.8, linestyle=":")
+    axis.set_title("Monte Carlo total PnL with one stressed-edge scenario")
+    axis.set_xlabel("Total PnL (flat unit stakes)")
+    axis.set_ylabel("Density")
+    axis.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "selection_edge_monte_carlo.png", dpi=160)
+    plt.close(fig)
+
+
 def save_outputs(
     output_dir: Path,
     selected_bets: pd.DataFrame,
     strategy_paths: dict[str, pd.DataFrame],
     strategy_summary: pd.DataFrame,
+    kelly_25_daily: pd.DataFrame,
+    stress_summary: pd.DataFrame,
 ) -> None:
-    """Persist the clean Kelly-only outputs for the latest run."""
+    """Write the Kelly backtest outputs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_bets.to_csv(output_dir / "selected_bets.csv", index=False)
     for strategy_name, path in strategy_paths.items():
         path.to_csv(output_dir / f"{strategy_name}_path.csv", index=False)
     strategy_summary.to_csv(output_dir / "strategy_summary.csv", index=False)
+    kelly_25_daily.to_csv(output_dir / "kelly_25_daily_pnl_ev.csv", index=False)
+    stress_summary.to_csv(output_dir / "selection_edge_stress_summary.csv", index=False)
 
 
 def run_kelly_backtest(
@@ -326,7 +540,7 @@ def run_kelly_backtest(
     max_bet: float = DEFAULT_MAX_BET,
     make_plots: bool = True,
 ) -> KellyBacktestArtifacts:
-    """Run the Kelly-only bankroll backtest on the current selected bets."""
+    """Run the Kelly bankroll backtest on the current selected bets."""
     data_path = Path(data_dir)
     result_path = Path(output_dir)
     market_thresholds = market_backtest.DEFAULT_MARKET_THRESHOLDS.copy()
@@ -352,9 +566,15 @@ def run_kelly_backtest(
     print_heading("Kelly Summary")
     print(strategy_summary.round(4).to_string(index=False))
 
-    save_outputs(result_path, selected_bets, strategy_paths, strategy_summary)
+    kelly_25_with_ev = attach_expected_pnl(strategy_paths["kelly_25"], selected_bets)
+    kelly_25_daily = build_daily_pnl_ev_table(kelly_25_with_ev)
+    stress_summary, stress_plot_payload = build_selection_edge_stress_summary(selected_bets)
+
+    save_outputs(result_path, selected_bets, strategy_paths, strategy_summary, kelly_25_daily, stress_summary)
     if make_plots:
         plot_bankroll_paths(strategy_paths, result_path, initial_bankroll)
+        plot_q3_pnl_ev_views(kelly_25_daily, result_path)
+        plot_selection_edge_monte_carlo(stress_plot_payload, result_path)
 
     return KellyBacktestArtifacts(
         selected_bets=selected_bets,
@@ -364,7 +584,7 @@ def run_kelly_backtest(
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for the Kelly-only bankroll backtest."""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Run a Kelly-only bankroll backtest on the current market-backtest selections.")
     parser.add_argument("--data-dir", default=".", help="Directory containing the current Q1 outputs and market files.")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory where Kelly outputs will be written.")
