@@ -1,5 +1,5 @@
 # Fdb version 4
-["pdflatex"] 1778597342.11679 "c:/backup/Corners_betting_strategy/Latex/ex1_writeup.tex" "ex1_writeup.pdf" "ex1_writeup" 1778597343.46737 0
+["pdflatex"] 1778683454.13229 "c:/backup/Corners_betting_strategy/Latex/ex1_writeup.tex" "ex1_writeup.pdf" "ex1_writeup" 1778683455.45067 0
   "../outputs/kelly_backtest/bankroll_paths_log.png" 1778154460 83233 a3565117abd7af15109ce40e16c2cecf ""
   "../outputs/kelly_backtest/kelly_25_cumulative_pnl_ev.png" 1778154460 70132 1ff87f3c546c00b3836599b5253c41c8 ""
   "../outputs/kelly_backtest/kelly_25_rolling_pnl_ev.png" 1778154461 122133 c462b02f3d4e679c616b74c91e290525 ""
@@ -86,10 +86,10 @@
   "C:/Users/admin/AppData/Local/Programs/MiKTeX/tex/latex/refcount/refcount.sty" 1576433952 9878 9e94e8fa600d95f9c7731bb21dfb67a4 ""
   "C:/Users/admin/AppData/Local/Programs/MiKTeX/tex/latex/rerunfilecheck/rerunfilecheck.sty" 1751104012 9684 a33a14b82ce60d6e77cb9be689d79ee6 ""
   "C:/Users/admin/AppData/Local/Programs/MiKTeX/tex/latex/url/url.sty" 1388490452 12796 8edb7d69a20b857904dd0ea757c14ec9 ""
-  "c:/backup/Corners_betting_strategy/Latex/ex1_writeup.tex" 1778597317 31399 b2337182ed5762aa47620566c9a9ac07 ""
-  "ex1_writeup.aux" 1778597343 1475 6f39df1609005b253180958d27997e8c "pdflatex"
-  "ex1_writeup.out" 1778597342 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
-  "ex1_writeup.tex" 1778597317 31399 b2337182ed5762aa47620566c9a9ac07 ""
+  "c:/backup/Corners_betting_strategy/Latex/ex1_writeup.tex" 1778682841 37706 461f3a178709b1e6f2c7453c55987ac0 ""
+  "ex1_writeup.aux" 1778683455 1477 cecb9dc09e07565083d885001e4cf100 "pdflatex"
+  "ex1_writeup.out" 1778683454 0 d41d8cd98f00b204e9800998ecf8427e "pdflatex"
+  "ex1_writeup.tex" 1778682841 37706 461f3a178709b1e6f2c7453c55987ac0 ""
   (generated)
   "ex1_writeup.aux"
   "ex1_writeup.log"
