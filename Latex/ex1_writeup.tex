@@ -160,6 +160,49 @@ The block answers: how strong is each team at winning corners, how weak is it at
 
 \bigskip
 
+\noindent \textbf{How the variance model is fitted.}
+The idea is simple: after Q1 makes a point prediction \(\hat{\mu}\) for a match, how far off was it?
+The answer is the squared error \((y - \hat{\mu})^{2}\).
+A larger squared error means the prediction was further from reality---i.e.\ the match was harder to predict.
+
+The variance model asks: \emph{before} a match is played, can we tell from observable signals whether the prediction will be more or less reliable?
+Three signals are used:
+\begin{itemize}
+  \item the predicted corner count \(\hat{\mu}\) itself---matches expected to produce many corners also tend to be noisier;
+  \item market certainty: how one-sided the market price looks, measured as \(\lvert p_{home} - 0.5 \rvert\), where \(p_{home}\) is the no-vig implied probability of the home team winning more corners from the 1X2 market (normalized probability from market odds). A value near zero means the market sees the match as a coin flip; a value near 0.5 means the market is very confident in one side. A more certain market signals a more predictable match, so the prediction error should be smaller;
+  \item how erratic that team has been recently (rolling standard deviation)---a team swinging between 3 and 11 corners week to week is genuinely harder to predict.
+\end{itemize}
+
+Because squared errors are always positive and heavily skewed, the model takes \(\log\) of them before fitting.
+A standard linear regression (OLS) is then run with those three signals as inputs and the log squared error as the output.
+The predicted log error is converted back to a variance by exponentiating.
+One final multiplicative correction is applied so that the average predicted variance exactly matches the average realised squared error on the training data---this keeps the model honest on the overall scale.
+Home and away corners each get their own separate variance model.
+
+\medskip
+\noindent \textbf{How the quantile model is fitted.}
+The quantile layer answers a different question: not ``how wide is the uncertainty on average?'' but ``given what this specific match looks like, where would the low and high ends of the prediction be?''
+
+Rather than fitting a formula, the approach is a lookup table built from history.
+The calibration matches are grouped into cells based on four features: how large the predicted mean is, how volatile the team has been recently, how wide the market spread is, and a composite market certainty score.
+The composite certainty is the average of three components:
+\begin{itemize}
+  \item \(\lvert p_{\text{OU,over}} - 0.5 \rvert\): the OU market quotes a line, e.g.\ ``total corners over/under 9.5''. After removing the bookmaker margin, the implied probability of going over becomes \(p_{\text{OU,over}}\). If the market prices this at \(0.5\), it genuinely sees the match as a coin flip around that line. If it prices it at \(0.8\), it is strongly confident the total will exceed 9.5. The distance from \(0.5\) captures how opinionated the market is about the total corner count.
+
+  \item \(\lvert p_{\text{1X2,home}} - p_{\text{1X2,away}} \rvert\): the 1X2 corner market offers three outcomes---home wins the corner count, away wins it, or they draw. After removing the margin, \(p_{\text{1X2,home}}\) and \(p_{\text{1X2,away}}\) are the implied probabilities for home and away respectively. Their gap measures how dominated the match is: a gap near zero means the market sees the two teams as roughly equal on corners; a large gap means it strongly favours one side.
+
+  \item \(\lvert p_{\text{HC,home}} - 0.5 \rvert\): the handicap market adjusts for expected imbalance by adding or subtracting a fixed number of corners from one team before deciding the winner---for example, home \(-1.5\) means home must win by at least 2 corners to win the bet. After the handicap is applied, \(p_{\text{HC,home}}\) is the implied probability that the home team still wins. A value near \(0.5\) means the handicap has made the match balanced; a value far from \(0.5\) means even the handicapped contest is lopsided, signalling that one team is expected to dominate corners by a wide margin.
+\end{itemize}
+All probabilities are computed after removing the bookmaker margin (no-vig conversion), so they sum to 1 across each market and reflect the market's genuine belief rather than the raw odds.
+Each cell collects all the historical prediction errors (actual minus predicted) for matches that fell into that cell.
+The 10th, 50th, and 90th percentiles of those errors are then stored for the cell.
+
+When a new match arrives, it is placed into the matching cell and the stored percentiles are added to its predicted mean to produce the quantile anchors \(\hat{q}_{10}\), \(\hat{q}_{50}\), \(\hat{q}_{90}\).
+If no historical matches fell into that cell, the model falls back to the percentiles computed across all matches.
+The result is a data-driven description of the prediction tails that makes no assumptions about the shape of the error distribution.
+
+\bigskip
+
 \noindent \textbf{What features go into the corner prediction model? How are they constructed?}
 
 \noindent The final production version uses 28 mean features. They fall into four groups.
@@ -229,7 +272,12 @@ Top signals are:
 
 \noindent \textbf{Why use LightGBM for the mean model instead of Ridge, Random Forest, or XGBoost?}
 
-\noindent I did not want to claim that by intuition alone, so I ran the comparison in code. On the Q1 validation split:
+\noindent Ridge regression is ordinary linear regression with an added penalty on the size of the coefficients: it minimises squared error plus \(\lambda \sum_j \beta_j^2\), where \(\lambda\) controls how much the coefficients are shrunk toward zero.
+The shrinkage prevents any single correlated feature from dominating and stops the model from overfitting on noise.
+Ridge is a natural first baseline here because corner counts are roughly continuous and in a small numeric range, so a linear model is not obviously wrong, and it can use all 28 features at once without further tuning beyond a single regularisation parameter.
+The other candidates---Random Forest, XGBoost, and LightGBM---are all ensemble tree methods that can capture nonlinear interactions, at the cost of more hyperparameters and longer training.
+
+I did not want to claim that by intuition alone, so I ran the comparison in code. On the Q1 validation split:
 \begin{center}
 \begin{tabular}{lccc}
 \toprule
@@ -306,7 +354,7 @@ It is:
 \hat{q}_{50},\;
 \hat{q}_{90}.
 \]
-That matters because Q2 needs a distribution, not just a point estimate. The mean tells Q2 where the centre is. The variance and quantile anchors tell Q2 how wide the distribution should be and how cautious it should be in the tails.
+The mean tells Q2 where the centre is. The variance and quantile anchors tell Q2 how wide the distribution should be and how cautious it should be in the tails.
 
 \bigskip
 
